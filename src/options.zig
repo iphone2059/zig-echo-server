@@ -17,17 +17,15 @@ fn parseNumber(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text, 10) catch null;
 }
 
-pub fn parse(allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.Options {
-    var args = std.process.argsWithAllocator(allocator) catch {
+pub fn parse(args: std.process.Args, allocator: std.mem.Allocator, error_buffer: []u8) ParseError!types.Options {
+    const process_args = args.toSlice(allocator) catch {
         setError(error_buffer, "unable to read command line");
         return error.InvalidArguments;
     };
-    defer args.deinit();
-    _ = args.skip();
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    while (args.next()) |arg| argv.append(allocator, arg) catch {
+    for (process_args[1..]) |arg| argv.append(allocator, arg) catch {
         setError(error_buffer, "out of memory while parsing arguments");
         return error.InvalidArguments;
     };

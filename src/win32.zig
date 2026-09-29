@@ -58,8 +58,8 @@ pub const Handle = struct {
 pub const VirtualMemory = struct {
     ptr: ?*anyopaque = null,
 
-    pub fn alloc(bytes: usize) !VirtualMemory {
-        const p = c.VirtualAlloc(null, bytes, c.MEM_RESERVE | c.MEM_COMMIT, c.PAGE_READWRITE);
+    pub fn alloc(byte_count: usize) !VirtualMemory {
+        const p = c.VirtualAlloc(null, byte_count, c.MEM_RESERVE | c.MEM_COMMIT, c.PAGE_READWRITE);
         if (p == null) return error.VirtualAlloc;
         return .{ .ptr = p };
     }

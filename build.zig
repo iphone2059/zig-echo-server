@@ -1,14 +1,14 @@
 const std = @import("std");
 
 fn addMsvcSdkEnvironment(b: *std.Build, module: *std.Build.Module) void {
-    const include_env = b.graph.env_map.get("INCLUDE") orelse
+    const include_env = b.graph.environ_map.get("INCLUDE") orelse
         @panic("INCLUDE is not set. Run from x64 Native Tools/Developer PowerShell for VS 2022, or call VsDevCmd.bat first.");
     var includes = std.mem.tokenizeScalar(u8, include_env, ';');
     while (includes.next()) |path| {
         if (path.len != 0) module.addIncludePath(.{ .cwd_relative = path });
     }
 
-    const lib_env = b.graph.env_map.get("LIB") orelse
+    const lib_env = b.graph.environ_map.get("LIB") orelse
         @panic("LIB is not set. Run from x64 Native Tools/Developer PowerShell for VS 2022, or call VsDevCmd.bat first.");
     var libs = std.mem.tokenizeScalar(u8, lib_env, ';');
     while (libs.next()) |path| {
@@ -54,4 +54,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run contract and heap tests");
     test_step.dependOn(&run_tests.step);
+
+    const acceptance_step = b.step("acceptance", "Run the currently available acceptance suite");
+    acceptance_step.dependOn(&run_tests.step);
 }
