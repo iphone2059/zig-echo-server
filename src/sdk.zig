@@ -190,6 +190,7 @@ pub const c = struct {
     pub extern fn GetQueuedCompletionStatus(port: HANDLE, bytes: *DWORD, completion_key: *ULONG_PTR, overlapped: *[*c]OVERLAPPED, milliseconds: DWORD) callconv(.winapi) BOOL;
     pub extern fn PostQueuedCompletionStatus(port: HANDLE, bytes: DWORD, completion_key: ULONG_PTR, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
     pub extern fn GetTickCount64() callconv(.winapi) u64;
+    pub extern fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
     pub extern fn QueryPerformanceCounter(value: *LARGE_INTEGER) callconv(.winapi) BOOL;
     pub extern fn QueryPerformanceFrequency(value: *LARGE_INTEGER) callconv(.winapi) BOOL;
     pub extern fn SetConsoleCtrlHandler(handler: ?*const fn (DWORD) callconv(.winapi) BOOL, add: BOOL) callconv(.winapi) BOOL;

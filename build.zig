@@ -98,4 +98,17 @@ pub fn build(b: *std.Build) void {
     const engine_step = b.step("test-engine", "Run server ownership and engine tests");
     engine_step.dependOn(&run_engine_tests.step);
     engine_step.dependOn(&run_stream_driver.step);
+
+    const udp_stop_module = b.createModule(.{
+        .root_source_file = b.path("tests/udp_stop_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    udp_stop_module.addImport("server", test_module);
+    const udp_stop_driver = b.addExecutable(.{
+        .name = "zig-echo-server-udp-stop-driver",
+        .root_module = udp_stop_module,
+    });
+    b.installArtifact(udp_stop_driver);
 }

@@ -4,17 +4,12 @@ const c = win32.c;
 const rio_mod = @import("rio.zig");
 const contract = @import("contract.zig");
 const types = @import("types.zig");
+const internal = @import("engine_internal.zig");
 
 const batch_size: u32 = 256;
 const address_bytes: u32 = @sizeOf(c.SOCKADDR_STORAGE) + 16;
 
-const Operation = enum(u8) { receive, send };
-const Slot = struct {
-    payload: c.RIO_BUF,
-    remote_address: c.RIO_BUF,
-    operation: Operation,
-    outstanding: bool,
-};
+const Slot = internal.UdpSlot;
 
 const Statistics = struct {
     completions: u64 = 0,
@@ -163,7 +158,8 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
                 for (results[0..count]) |result| {
                     const raw = result.RequestContext orelse win32.failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);
                     const slot: *Slot = @ptrCast(@alignCast(raw));
-                    if (!slot.outstanding or outstanding == 0) win32.failFast("UDP completion invariant", c.ERROR_INVALID_DATA);
+                    if (!internal.udpContextValid(slot, slots) or !slot.outstanding or outstanding == 0)
+                        win32.failFast("UDP completion invariant", c.ERROR_INVALID_DATA);
                     slot.outstanding = false;
                     outstanding -= 1;
                     stats.completions += 1;
@@ -233,9 +229,11 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
     if (options.stats) {
         const elapsed = @max(@as(u64, 1), c.GetTickCount64() - start);
         const mib_per_sec = (@as(f64, @floatFromInt(stats.bytes)) * 1000.0) / (@as(f64, @floatFromInt(elapsed)) * 1024.0 * 1024.0);
-        std.debug.print("final protocol=udp elapsed_ms={d} completions={d} receives={d} sends={d} bytes={d} MiB_per_sec={d:.2} outstanding={d}\n", .{
+        var output_buffer: [512]u8 = undefined;
+        const output = std.fmt.bufPrint(&output_buffer, "final protocol=udp elapsed_ms={d} completions={d} receives={d} sends={d} bytes={d} MiB_per_sec={d:.2} outstanding={d}\n", .{
             elapsed, stats.completions, stats.receives, stats.sends, stats.bytes, mib_per_sec, outstanding,
-        });
+        }) catch win32.failFast("format UDP statistics", c.ERROR_INSUFFICIENT_BUFFER);
+        if (!win32.writeStdout(output)) win32.failFast("write UDP statistics", c.GetLastError());
     }
     return if (failed) .network else .success;
 }

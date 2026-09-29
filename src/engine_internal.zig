@@ -156,3 +156,7 @@ pub fn requestContextValid(request: *const Request, connections: []const Connect
 pub fn acceptContextValid(operation: *const AcceptOperation, operations: []const AcceptOperation, owner: *const Acceptor) bool {
     return pointerInSlice(AcceptOperation, operation, operations) and operation.owner == owner;
 }
+
+pub fn udpContextValid(slot: *const UdpSlot, slots: []const UdpSlot) bool {
+    return pointerInSlice(UdpSlot, slot, slots);
+}
