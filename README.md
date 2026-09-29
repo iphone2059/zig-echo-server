@@ -1,47 +1,65 @@
-# zig-echo-server — Zig 0.17-dev + Microsoft Windows SDK
+# zig-echo-server
 
-This is the first executable migration slice of the supplied `cpp-echo-server`.
+Independent Windows TCP/UDP echo server rewritten from `cpp-echo-server` in Zig. The data path is always Winsock Registered I/O (RIO); IOCP is used for RIO CQ notification, TCP `AcceptEx` admission, worker control, and shutdown coordination. There is no ordinary `send`/`recv`, `WSAPoll`, `select`, or `std.net` fallback.
 
-Implemented here:
+## Toolchain
 
-- Microsoft Windows SDK headers via `@cImport` (`winsock2.h`, `windows.h`, `mswsock.h`, `ws2tcpip.h`).
-- MSVC ABI target.
-- RIO function table loaded with `WSAIoctl(SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, WSAID_MULTIPLE_RIO)`.
-- `VirtualAlloc` + `RIORegisterBuffer`.
-- RIO CQ notified through IOCP.
-- Production-style UDP RIO echo loop with fixed slots, no hot-path allocation, notification state tracking, CQ corruption fail-fast, shutdown drain, and final statistics.
-- Contract and indexed timer-heap modules/tests, ready for the TCP slice.
+- Windows x64, MSVC ABI
+- Zig `0.17.0-dev.2320+1e770dbef`
+- Visual Studio C++ tools and Windows SDK
+- PowerShell 7 for the full integration suite
 
-## Prerequisites
+The project owns its Win32/RIO ABI declarations and all implementation code. It has no source or build dependency on any client or sibling echo project. The acceptance script may launch the separately built C++ client as an external interoperability peer.
 
-Use Zig `0.17.0-dev.2320+1e770dbef` and VS 2022 + Windows SDK. Start **Developer PowerShell for VS 2022** (x64), then:
+## Build
+
+From the project root:
 
 ```powershell
-zig version
 .\build.ps1 ReleaseFast
 ```
 
-Direct command:
+`build.ps1` pins `C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe`, discovers Visual Studio through `vswhere`, initializes the x64 MSVC/SDK environment, builds the executable, and runs the complete suite. Use `-BuildOnly` to omit tests.
+
+Artifacts are written to `zig-out\bin`.
+
+## TCP
 
 ```powershell
-zig build -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast
+.\zig-out\bin\zig-echo-server.exe `
+  /p tcp /s 7000 /threads 8 /t 300 /rio-buffer 16384 `
+  /cq 65536 /memory 2147483648 /q /stats
 ```
 
-The build deliberately reads the `INCLUDE` and `LIB` environment variables from the VS developer environment. This forces SDK/MSVC headers and libraries to participate rather than silently using Zig's bundled MinGW include tree.
+TCP uses multiple pre-posted `AcceptEx` operations. Each accepted socket is handed to one fixed worker, which owns its RIO RQ, registered-buffer slot, timer entry, and RIO CQ. IOCP wakes the worker once the CQ is readable; the worker drains completions in batches and re-arms `RIONotify`.
 
-## Run
+## UDP
 
 ```powershell
-.\zig-out\bin\zig-echo-server.exe /p udp /s 7000 /k 4096 /cq 8192 /memory 1073741824 /stats
+.\zig-out\bin\zig-echo-server.exe `
+  /p udp /s 7000 /k 4096 /rio-buffer 65507 `
+  /cq 8192 /memory 1073741824 /q /stats
 ```
+
+UDP uses fixed registered payload/address slots, `RIOReceiveEx`/`RIOSendEx`, batched CQ drain, and an outstanding-operation shutdown barrier.
+
+`/w seconds` requests a finite server run. Omitting `/w` leaves the server running until Ctrl+C, Ctrl+Break, or console close. `/t seconds` is the TCP idle timeout. `/stats` prints per-worker TCP lines followed by the aggregate terminal line; UDP prints its aggregate terminal line. Successful statistics go to stdout, while errors go to stderr.
 
 ## Tests
 
+Run the complete Debug and optimized gates:
+
 ```powershell
-zig build test -Dtarget=x86_64-windows-msvc -Doptimize=Debug
+.\build.ps1 Debug
+.\build.ps1 ReleaseFast
 ```
 
-The next TCP slice should port the original per-worker CQ/IOCP model plus `AcceptEx` handoff without introducing `std.net` or ordinary `recv/send` fallbacks.
+The suite covers CLI contracts, timer/reference models, native resource ownership, real RIO-CQ-to-IOCP worker lifecycle, AcceptEx ownership transitions, split TCP I/O, capacity exhaustion and reuse, idle timeout, connection storms, C++ client interoperability for TCP and UDP including 65507-byte datagrams, deterministic exit-4 failure boundaries, and source-policy rejection of fallback APIs or cross-project imports.
 
+Individual integration gates can also be run after a build:
 
-> Validation note: this package was source-reviewed in a non-Windows environment; run the first build in VS 2022 Developer PowerShell so Microsoft SDK `@cImport` translation is validated by Zig on the target machine.
+```powershell
+pwsh -NoProfile -File .\tests\process_tests.ps1
+pwsh -NoProfile -File .\tests\fault_process_tests.ps1
+pwsh -NoProfile -File .\tests\source_policy.ps1
+```
