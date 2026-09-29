@@ -42,6 +42,7 @@ pub const c = struct {
     pub const ERROR_IO_INCOMPLETE: DWORD = 996;
     pub const ERROR_INVALID_STATE: DWORD = 5023;
     pub const WAIT_TIMEOUT: DWORD = 258;
+    pub const INFINITE: DWORD = 0xffffffff;
 
     pub const MEM_COMMIT: DWORD = 0x1000;
     pub const MEM_RESERVE: DWORD = 0x2000;

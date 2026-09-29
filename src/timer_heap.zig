@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const invalid_position: u32 = std.math.maxInt(u32);
+pub const infinite: u32 = std.math.maxInt(u32);
 
 pub const Node = struct {
     deadline: u64,
@@ -13,7 +14,7 @@ pub const Heap = struct {
     len: u32 = 0,
 
     pub fn init(nodes: []Node, positions: []u32) !Heap {
-        if (nodes.len != positions.len or nodes.len > std.math.maxInt(u32)) return error.InvalidCapacity;
+        if (nodes.len == 0 or nodes.len != positions.len or nodes.len > std.math.maxInt(u32)) return error.InvalidCapacity;
         @memset(positions, invalid_position);
         return .{ .nodes = nodes, .positions = positions };
     }
@@ -91,10 +92,10 @@ pub const Heap = struct {
     }
 
     pub fn waitMilliseconds(self: *const Heap, now: u64) u32 {
-        if (self.len == 0) return 100;
+        if (self.len == 0) return infinite;
         const deadline = self.nodes[0].deadline;
         if (deadline <= now) return 0;
-        return @intCast(@min(deadline - now, @as(u64, 100)));
+        return @intCast(@min(deadline - now, @as(u64, infinite - 1)));
     }
 };
 
