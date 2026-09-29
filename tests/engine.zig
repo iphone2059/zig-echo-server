@@ -6,6 +6,7 @@ const c = win32.c;
 const timer_heap = server.timer_heap;
 const internal = server.engine_internal;
 const tcp_worker = server.tcp_worker;
+const tcp_acceptor = server.tcp_acceptor;
 
 test "Win32 owner transfer and reset are idempotent" {
     var socket: win32.Socket = .{};
@@ -308,4 +309,45 @@ test "TCP worker arms RIO notification before ready and drains control shutdown"
     try std.testing.expect(!worker.notification_armed);
     try std.testing.expectEqual(@as(u32, 0), worker.active_count);
     try std.testing.expect(!failed.load(.acquire));
+}
+
+test "AcceptEx operation permits only the exact ownership cycle" {
+    var operation: internal.AcceptOperation = .{};
+    try std.testing.expect(tcp_acceptor.transitionState(&operation, .idle, .posted));
+    try std.testing.expect(!tcp_acceptor.transitionState(&operation, .idle, .posted));
+    try std.testing.expect(tcp_acceptor.transitionState(&operation, .posted, .transit));
+    try std.testing.expect(!tcp_acceptor.transitionState(&operation, .posted, .idle));
+    try std.testing.expect(tcp_acceptor.transitionState(&operation, .transit, .idle));
+}
+
+test "AcceptEx completion identity requires a published owned operation" {
+    var acceptor: internal.Acceptor = .{};
+    var operations: [2]internal.AcceptOperation = .{ .{}, .{} };
+    acceptor.operations = &operations;
+    acceptor.operation_count = operations.len;
+    operations[0].owner = &acceptor;
+    operations[0].state = .posted;
+    try std.testing.expect(tcp_acceptor.completionIdentityValid(&acceptor, &operations[0].overlapped));
+    try std.testing.expect(!tcp_acceptor.completionIdentityValid(&acceptor, &operations[1].overlapped));
+    operations[0].state = .transit;
+    try std.testing.expect(!tcp_acceptor.completionIdentityValid(&acceptor, &operations[0].overlapped));
+}
+
+test "AcceptEx readiness requires a listening socket and every accept posted" {
+    try std.testing.expect(!tcp_acceptor.canPublishReady(c.INVALID_SOCKET, 32, 32));
+    try std.testing.expect(!tcp_acceptor.canPublishReady(9, 31, 32));
+    try std.testing.expect(tcp_acceptor.canPublishReady(9, 32, 32));
+}
+
+test "AcceptEx shutdown closes posted sockets but waits for transit acknowledgements" {
+    try std.testing.expectEqual(tcp_acceptor.ShutdownAction.none, tcp_acceptor.shutdownAction(.idle));
+    try std.testing.expectEqual(tcp_acceptor.ShutdownAction.close_posted, tcp_acceptor.shutdownAction(.posted));
+    try std.testing.expectEqual(tcp_acceptor.ShutdownAction.wait_ack, tcp_acceptor.shutdownAction(.transit));
+}
+
+test "AcceptEx pool count is exactly 32 per worker capped at 1024" {
+    try std.testing.expectEqual(@as(?u32, 32), tcp_acceptor.operationCount(1));
+    try std.testing.expectEqual(@as(?u32, 256), tcp_acceptor.operationCount(8));
+    try std.testing.expectEqual(@as(?u32, 1024), tcp_acceptor.operationCount(64));
+    try std.testing.expectEqual(@as(?u32, null), tcp_acceptor.operationCount(0));
 }

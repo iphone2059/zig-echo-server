@@ -111,4 +111,17 @@ pub fn build(b: *std.Build) void {
         .root_module = udp_stop_module,
     });
     b.installArtifact(udp_stop_driver);
+
+    const tcp_acceptor_driver_module = b.createModule(.{
+        .root_source_file = b.path("tests/tcp_acceptor_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tcp_acceptor_driver_module.addImport("server", test_module);
+    const tcp_acceptor_driver = b.addExecutable(.{
+        .name = "zig-echo-server-tcp-acceptor-driver",
+        .root_module = tcp_acceptor_driver_module,
+    });
+    b.installArtifact(tcp_acceptor_driver);
 }

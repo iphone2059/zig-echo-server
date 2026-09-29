@@ -104,13 +104,16 @@ pub const Acceptor = struct {
     failed: ?*std.atomic.Value(bool) = null,
     port: c.HANDLE = null,
     thread: c.HANDLE = null,
+    ready_event: c.HANDLE = null,
     listener: c.SOCKET = c.INVALID_SOCKET,
-    accept_ex: ?*const anyopaque = null,
-    get_accept_addresses: ?*const anyopaque = null,
+    accept_ex: ?c.LPFN_ACCEPTEX = null,
+    get_accept_addresses: ?c.LPFN_GETACCEPTEXSOCKADDRS = null,
     operations: ?[*]AcceptOperation = null,
     operation_count: u32 = 0,
     next_worker: u32 = 0,
     stopping: bool = false,
+    ready: bool = false,
+    startup_ok: bool = false,
 };
 
 pub const UdpSlot = struct {

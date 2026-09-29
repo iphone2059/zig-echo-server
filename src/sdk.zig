@@ -26,13 +26,17 @@ pub const c = struct {
     pub const SOL_SOCKET: c_int = 0xffff;
     pub const SO_SNDBUF: c_int = 0x1001;
     pub const SO_RCVBUF: c_int = 0x1002;
+    pub const SO_UPDATE_ACCEPT_CONTEXT: c_int = 0x700B;
     pub const TCP_NODELAY: c_int = 1;
     pub const INADDR_ANY: u32 = 0;
 
     pub const WSA_FLAG_OVERLAPPED: DWORD = 0x01;
     pub const WSA_FLAG_REGISTERED_IO: DWORD = 0x100;
     pub const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000024;
+    pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000006;
     pub const WSAECONNRESET: i32 = 10054;
+    pub const WSAEINVAL: i32 = 10022;
+    pub const SOMAXCONN: c_int = 0x7fffffff;
 
     pub const ERROR_SUCCESS: DWORD = 0;
     pub const ERROR_INVALID_DATA: DWORD = 13;
@@ -40,6 +44,7 @@ pub const c = struct {
     pub const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
     pub const ERROR_ARITHMETIC_OVERFLOW: DWORD = 534;
     pub const ERROR_IO_INCOMPLETE: DWORD = 996;
+    pub const ERROR_IO_PENDING: DWORD = 997;
     pub const ERROR_INVALID_STATE: DWORD = 5023;
     pub const WAIT_TIMEOUT: DWORD = 258;
     pub const WAIT_OBJECT_0: DWORD = 0;
@@ -142,6 +147,8 @@ pub const c = struct {
     pub const LPFN_RIOREGISTERBUFFER = *const fn ([*c]u8, DWORD) callconv(.winapi) RIO_BUFFERID;
     pub const LPFN_RIORESIZECOMPLETIONQUEUE = *const fn (RIO_CQ, DWORD) callconv(.winapi) BOOL;
     pub const LPFN_RIORESIZEREQUESTQUEUE = *const fn (RIO_RQ, DWORD, DWORD) callconv(.winapi) BOOL;
+    pub const LPFN_ACCEPTEX = *const fn (SOCKET, SOCKET, ?*anyopaque, DWORD, DWORD, DWORD, *DWORD, *OVERLAPPED) callconv(.winapi) BOOL;
+    pub const LPFN_GETACCEPTEXSOCKADDRS = *const fn (?*anyopaque, DWORD, DWORD, DWORD, *?*SOCKADDR, *c_int, *?*SOCKADDR, *c_int) callconv(.winapi) void;
 
     pub const RIO_EXTENSION_FUNCTION_TABLE = extern struct {
         cbSize: DWORD,
@@ -166,6 +173,18 @@ pub const c = struct {
         .Data3 = 0x4005,
         .Data4 = .{ 0xb1, 0x65, 0x9e, 0x2e, 0xe8, 0xc7, 0x9e, 0x3f },
     };
+    pub const WSAID_ACCEPTEX: GUID = .{
+        .Data1 = 0xb5367df1,
+        .Data2 = 0xcbac,
+        .Data3 = 0x11cf,
+        .Data4 = .{ 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92 },
+    };
+    pub const WSAID_GETACCEPTEXSOCKADDRS: GUID = .{
+        .Data1 = 0xb5367df2,
+        .Data2 = 0xcbac,
+        .Data3 = 0x11cf,
+        .Data4 = .{ 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92 },
+    };
 
     pub extern fn WSAStartup(version: u16, data: *WSADATA) callconv(.winapi) c_int;
     pub extern fn WSACleanup() callconv(.winapi) c_int;
@@ -174,8 +193,10 @@ pub const c = struct {
     pub extern fn closesocket(socket: SOCKET) callconv(.winapi) c_int;
     pub extern fn setsockopt(socket: SOCKET, level: c_int, option: c_int, value: [*c]const u8, length: c_int) callconv(.winapi) c_int;
     pub extern fn bind(socket: SOCKET, address: *const SOCKADDR, address_length: c_int) callconv(.winapi) c_int;
+    pub extern fn listen(socket: SOCKET, backlog: c_int) callconv(.winapi) c_int;
     pub extern fn connect(socket: SOCKET, address: *const SOCKADDR, address_length: c_int) callconv(.winapi) c_int;
     pub extern fn WSAIoctl(socket: SOCKET, code: DWORD, in_buffer: ?*anyopaque, in_bytes: DWORD, out_buffer: ?*anyopaque, out_bytes: DWORD, bytes_returned: *DWORD, overlapped: ?*OVERLAPPED, completion: ?*anyopaque) callconv(.winapi) c_int;
+    pub extern fn WSAGetOverlappedResult(socket: SOCKET, overlapped: *OVERLAPPED, transferred: *DWORD, wait: BOOL, flags: *DWORD) callconv(.winapi) BOOL;
     pub extern fn htons(value: u16) callconv(.winapi) u16;
     pub extern fn htonl(value: u32) callconv(.winapi) u32;
 
