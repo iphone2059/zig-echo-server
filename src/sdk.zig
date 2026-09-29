@@ -51,6 +51,8 @@ pub const c = struct {
     pub const CTRL_C_EVENT: DWORD = 0;
     pub const CTRL_BREAK_EVENT: DWORD = 1;
     pub const CTRL_CLOSE_EVENT: DWORD = 2;
+    pub const STD_OUTPUT_HANDLE: DWORD = 0xfffffff5;
+    pub const STD_ERROR_HANDLE: DWORD = 0xfffffff4;
 
     pub const WSADATA = extern struct {
         wVersion: u16,
@@ -176,6 +178,10 @@ pub const c = struct {
     pub extern fn htonl(value: u32) callconv(.winapi) u32;
 
     pub extern fn GetLastError() callconv(.winapi) DWORD;
+    pub extern fn GetCurrentProcess() callconv(.winapi) HANDLE;
+    pub extern fn TerminateProcess(process: HANDLE, exit_code: u32) callconv(.winapi) BOOL;
+    pub extern fn GetStdHandle(which: DWORD) callconv(.winapi) HANDLE;
+    pub extern fn WriteFile(handle: HANDLE, buffer: [*]const u8, bytes: DWORD, written: *DWORD, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
     pub extern fn CloseHandle(handle: HANDLE) callconv(.winapi) BOOL;
     pub extern fn VirtualAlloc(address: ?*anyopaque, bytes: usize, allocation_type: DWORD, protection: DWORD) callconv(.winapi) ?*anyopaque;
     pub extern fn VirtualFree(address: ?*anyopaque, bytes: usize, free_type: DWORD) callconv(.winapi) BOOL;

@@ -69,4 +69,33 @@ pub fn build(b: *std.Build) void {
     const run_contract_tests = b.addRunArtifact(contract_tests);
     const contract_step = b.step("test-contracts", "Run exact server CLI and pure contract tests");
     contract_step.dependOn(&run_contract_tests.step);
+
+    const engine_test_module = b.createModule(.{
+        .root_source_file = b.path("tests/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    engine_test_module.addImport("server", test_module);
+    const engine_tests = b.addTest(.{ .root_module = engine_test_module });
+    const run_engine_tests = b.addRunArtifact(engine_tests);
+
+    const stream_driver_module = b.createModule(.{
+        .root_source_file = b.path("tests/stream_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    stream_driver_module.addImport("server", test_module);
+    const stream_driver = b.addExecutable(.{
+        .name = "server-stream-driver",
+        .root_module = stream_driver_module,
+    });
+    const run_stream_driver = b.addRunArtifact(stream_driver);
+    run_stream_driver.expectStdOutEqual("stdout-only\n");
+    run_stream_driver.expectStdErrEqual("stderr-only\n");
+
+    const engine_step = b.step("test-engine", "Run server ownership and engine tests");
+    engine_step.dependOn(&run_engine_tests.step);
+    engine_step.dependOn(&run_stream_driver.step);
 }

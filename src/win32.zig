@@ -1,13 +1,39 @@
 const std = @import("std");
 pub const c = @import("sdk.zig").c;
 
-pub fn report(stage: []const u8, native_error: u32) void {
-    std.debug.print("{s} failed: native_error={d}\n", .{ stage, native_error });
+fn writeAll(handle: c.HANDLE, bytes: []const u8) bool {
+    if (handle == null or handle == c.INVALID_HANDLE_VALUE) return false;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const remaining = bytes.len - offset;
+        const amount: c.DWORD = @intCast(@min(remaining, std.math.maxInt(c.DWORD)));
+        var written: c.DWORD = 0;
+        if (c.WriteFile(handle, bytes[offset..].ptr, amount, &written, null) == c.FALSE or written == 0) return false;
+        offset += written;
+    }
+    return true;
 }
 
+pub fn writeStdout(bytes: []const u8) bool {
+    return writeAll(c.GetStdHandle(c.STD_OUTPUT_HANDLE), bytes);
+}
+
+pub fn writeStderr(bytes: []const u8) bool {
+    return writeAll(c.GetStdHandle(c.STD_ERROR_HANDLE), bytes);
+}
+
+pub fn reportNative(stage: []const u8, native_error: u32) void {
+    var buffer: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, native_error }) catch return;
+    _ = writeStderr(text);
+}
+
+pub const report = reportNative;
+
 pub fn failFast(stage: []const u8, native_error: u32) noreturn {
-    std.debug.print("fatal invariant: {s}, native_error={d}\n", .{ stage, native_error });
-    std.process.exit(4);
+    reportNative(stage, native_error);
+    _ = c.TerminateProcess(c.GetCurrentProcess(), 4);
+    unreachable;
 }
 
 pub const Winsock = struct {
@@ -30,6 +56,10 @@ pub const Winsock = struct {
 pub const Socket = struct {
     value: c.SOCKET = c.INVALID_SOCKET,
 
+    pub fn get(self: *const Socket) c.SOCKET {
+        return self.value;
+    }
+
     pub fn deinit(self: *Socket) void {
         if (self.value != c.INVALID_SOCKET) {
             _ = c.closesocket(self.value);
@@ -42,21 +72,48 @@ pub const Socket = struct {
         self.value = c.INVALID_SOCKET;
         return value;
     }
+
+    pub fn reset(self: *Socket, value: c.SOCKET) void {
+        self.deinit();
+        self.value = value;
+    }
 };
 
 pub const Handle = struct {
     value: c.HANDLE = null,
 
+    pub fn get(self: *const Handle) c.HANDLE {
+        return self.value;
+    }
+
     pub fn deinit(self: *Handle) void {
-        if (self.value != null) {
+        if (self.value != null and self.value != c.INVALID_HANDLE_VALUE) {
             _ = c.CloseHandle(self.value);
-            self.value = null;
         }
+        self.value = null;
+    }
+
+    pub fn take(self: *Handle) c.HANDLE {
+        const value = self.value;
+        self.value = null;
+        return value;
+    }
+
+    pub fn reset(self: *Handle, value: c.HANDLE) void {
+        self.deinit();
+        self.value = value;
     }
 };
 
+pub const ThreadHandle = Handle;
+pub const EventHandle = Handle;
+
 pub const VirtualMemory = struct {
     ptr: ?*anyopaque = null,
+
+    pub fn get(self: *const VirtualMemory) ?*anyopaque {
+        return self.ptr;
+    }
 
     pub fn alloc(byte_count: usize) !VirtualMemory {
         const p = c.VirtualAlloc(null, byte_count, c.MEM_RESERVE | c.MEM_COMMIT, c.PAGE_READWRITE);
@@ -68,6 +125,17 @@ pub const VirtualMemory = struct {
         return @ptrCast(self.ptr.?);
     }
 
+    pub fn take(self: *VirtualMemory) ?*anyopaque {
+        const value = self.ptr;
+        self.ptr = null;
+        return value;
+    }
+
+    pub fn reset(self: *VirtualMemory, value: ?*anyopaque) void {
+        self.deinit();
+        self.ptr = value;
+    }
+
     pub fn deinit(self: *VirtualMemory) void {
         if (self.ptr) |p| {
             _ = c.VirtualFree(p, 0, c.MEM_RELEASE);
@@ -76,8 +144,12 @@ pub const VirtualMemory = struct {
     }
 };
 
+pub fn registeredSocketFlags() c.DWORD {
+    return c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO;
+}
+
 pub fn registeredSocket(socket_type: c_int, protocol: c_int) c.SOCKET {
-    return c.WSASocketW(c.AF_INET, socket_type, protocol, null, 0, c.WSA_FLAG_OVERLAPPED | c.WSA_FLAG_REGISTERED_IO);
+    return c.WSASocketW(c.AF_INET, socket_type, protocol, null, 0, registeredSocketFlags());
 }
 
 pub fn configureSocket(socket_value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) bool {
