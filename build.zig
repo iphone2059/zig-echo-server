@@ -124,4 +124,29 @@ pub fn build(b: *std.Build) void {
         .root_module = tcp_acceptor_driver_module,
     });
     b.installArtifact(tcp_acceptor_driver);
+
+    const fault_driver_module = b.createModule(.{
+        .root_source_file = b.path("tests/fault_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fault_driver_module.addImport("server", test_module);
+    const fault_driver = b.addExecutable(.{
+        .name = "zig-echo-server-fault-driver",
+        .root_module = fault_driver_module,
+    });
+    b.installArtifact(fault_driver);
+
+    const source_policy = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/source_policy.ps1" });
+    const fault_process = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/fault_process_tests.ps1" });
+    const process_tests = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
+    fault_process.step.dependOn(b.getInstallStep());
+    process_tests.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_contract_tests.step);
+    test_step.dependOn(&run_engine_tests.step);
+    test_step.dependOn(&run_stream_driver.step);
+    test_step.dependOn(&source_policy.step);
+    test_step.dependOn(&fault_process.step);
+    test_step.dependOn(&process_tests.step);
 }

@@ -15,6 +15,25 @@ $stderrPath = Join-Path $scratch 'server.stderr.txt'
 $port = Get-Random -Minimum 20000 -Maximum 50000
 
 try {
+    $serverTcpStdout = Join-Path $scratch 'server-tcp.stdout.txt'
+    $serverTcpStderr = Join-Path $scratch 'server-tcp.stderr.txt'
+    $serverTcpPort = Get-Random -Minimum 20000 -Maximum 50000
+    $serverTcpProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'tcp', '/s', $serverTcpPort, '/threads', '2', '/t', '1', '/w', '3', '/rio-buffer', '4096', '/cq', '256', '/memory', '67108864', '/q', '/stats') -PassThru -RedirectStandardOutput $serverTcpStdout -RedirectStandardError $serverTcpStderr
+    Start-Sleep -Milliseconds 400
+    if ($serverTcpProcess.HasExited) { throw "TCP server exited during startup with code $($serverTcpProcess.ExitCode): $(Get-Content -Raw $serverTcpStderr)" }
+    & $client 127.0.0.1 /p tcp /r $serverTcpPort /n 1000 /c 16 /threads 2 /k 4 /zt 64 /q
+    if ($LASTEXITCODE -ne 0) { throw "TCP C++ client acceptance failed with exit code $LASTEXITCODE" }
+    if (-not $serverTcpProcess.WaitForExit(10000)) { throw 'TCP server run-duration shutdown did not converge.' }
+    if ($serverTcpProcess.ExitCode -ne 0) { throw "TCP server failed with exit code $($serverTcpProcess.ExitCode)." }
+    $serverTcpError = Get-Content -Raw -LiteralPath $serverTcpStderr
+    $serverTcpOutput = Get-Content -Raw -LiteralPath $serverTcpStdout
+    if ($serverTcpError.Length -ne 0) { throw "Successful TCP server wrote to stderr: $serverTcpError" }
+    $workerLines = [regex]::Matches($serverTcpOutput, '(?m)^\[worker \d+\] accepted=\d+ completions=\d+ receives=\d+ sends=\d+ bytes=\d+ active=0\r?$')
+    if ($workerLines.Count -ne 2) { throw "Expected two exact per-worker statistics lines: $serverTcpOutput" }
+    if ($serverTcpOutput -notmatch '(?m)^final protocol=tcp elapsed_ms=\d+ accepted=\d+ completions=\d+ receives=\d+ sends=\d+ bytes=\d+ MiB_per_sec=\d+\.\d{2} active=0\r?$') {
+        throw "TCP aggregate statistics schema mismatch: $serverTcpOutput"
+    }
+
     $tcpStdout = Join-Path $scratch 'tcp.stdout.txt'
     $tcpStderr = Join-Path $scratch 'tcp.stderr.txt'
     $tcpPort = Get-Random -Minimum 20000 -Maximum 50000
@@ -144,6 +163,7 @@ try {
     Write-Host 'udp_process_tests: PASS'
 }
 finally {
+    if ($serverTcpProcess -and -not $serverTcpProcess.HasExited) { Stop-Process -Id $serverTcpProcess.Id -Force }
     if ($tcpProcess -and -not $tcpProcess.HasExited) { Stop-Process -Id $tcpProcess.Id -Force }
     if ($serverProcess -and -not $serverProcess.HasExited) { Stop-Process -Id $serverProcess.Id -Force }
     if ($stopProcess -and -not $stopProcess.HasExited) { Stop-Process -Id $stopProcess.Id -Force }

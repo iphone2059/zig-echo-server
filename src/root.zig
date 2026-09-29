@@ -9,6 +9,7 @@ pub const udp = @import("udp.zig");
 pub const engine_internal = @import("engine_internal.zig");
 pub const tcp_worker = @import("tcp_worker.zig");
 pub const tcp_acceptor = @import("tcp_acceptor.zig");
+pub const engine = @import("engine.zig");
 
 test {
     _ = types;
@@ -22,4 +23,5 @@ test {
     _ = engine_internal;
     _ = tcp_worker;
     _ = tcp_acceptor;
+    _ = engine;
 }

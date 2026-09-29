@@ -58,6 +58,7 @@ pub const c = struct {
     pub const CTRL_C_EVENT: DWORD = 0;
     pub const CTRL_BREAK_EVENT: DWORD = 1;
     pub const CTRL_CLOSE_EVENT: DWORD = 2;
+    pub const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
     pub const STD_OUTPUT_HANDLE: DWORD = 0xfffffff5;
     pub const STD_ERROR_HANDLE: DWORD = 0xfffffff4;
 
@@ -217,6 +218,7 @@ pub const c = struct {
     pub extern fn CreateThread(attributes: ?*anyopaque, stack_size: usize, start: *const fn (?*anyopaque) callconv(.winapi) DWORD, parameter: ?*anyopaque, flags: DWORD, thread_id: ?*DWORD) callconv(.winapi) HANDLE;
     pub extern fn getpeername(socket: SOCKET, address: *SOCKADDR, address_length: *c_int) callconv(.winapi) c_int;
     pub extern fn GetTickCount64() callconv(.winapi) u64;
+    pub extern fn GetActiveProcessorCount(group_number: u16) callconv(.winapi) DWORD;
     pub extern fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
     pub extern fn QueryPerformanceCounter(value: *LARGE_INTEGER) callconv(.winapi) BOOL;
     pub extern fn QueryPerformanceFrequency(value: *LARGE_INTEGER) callconv(.winapi) BOOL;

@@ -7,6 +7,7 @@ const timer_heap = server.timer_heap;
 const internal = server.engine_internal;
 const tcp_worker = server.tcp_worker;
 const tcp_acceptor = server.tcp_acceptor;
+const coordinator = server.engine;
 
 test "Win32 owner transfer and reset are idempotent" {
     var socket: win32.Socket = .{};
@@ -350,4 +351,35 @@ test "AcceptEx pool count is exactly 32 per worker capped at 1024" {
     try std.testing.expectEqual(@as(?u32, 256), tcp_acceptor.operationCount(8));
     try std.testing.expectEqual(@as(?u32, 1024), tcp_acceptor.operationCount(64));
     try std.testing.expectEqual(@as(?u32, null), tcp_acceptor.operationCount(0));
+}
+
+test "TCP coordinator resolves automatic worker count to the C++ 1 through 32 contract" {
+    try std.testing.expectEqual(@as(u32, 1), coordinator.resolveWorkerCount(0, 0));
+    try std.testing.expectEqual(@as(u32, 1), coordinator.resolveWorkerCount(0, 1));
+    try std.testing.expectEqual(@as(u32, 12), coordinator.resolveWorkerCount(0, 12));
+    try std.testing.expectEqual(@as(u32, 32), coordinator.resolveWorkerCount(0, 128));
+    try std.testing.expectEqual(@as(u32, 7), coordinator.resolveWorkerCount(7, 128));
+}
+
+test "TCP coordinator admits only acceptor-first shutdown ordering" {
+    var sequence: coordinator.ShutdownSequence = .{};
+    try std.testing.expect(!sequence.advance(.admission_closed));
+    try std.testing.expect(sequence.advance(.acceptor_stopped));
+    try std.testing.expect(sequence.advance(.admission_closed));
+    try std.testing.expect(!sequence.advance(.joined));
+    try std.testing.expect(sequence.advance(.workers_stopped));
+    try std.testing.expect(sequence.advance(.joined));
+    try std.testing.expectEqual(coordinator.ShutdownPhase.joined, sequence.phase);
+}
+
+test "TCP coordinator formats exact aggregate statistics on stdout" {
+    var buffer: [512]u8 = undefined;
+    const output = try coordinator.formatTcpStatistics(&buffer, &.{
+        .accepted = 4,
+        .completions = 9,
+        .receives = 5,
+        .sends = 4,
+        .bytes = 1048576,
+    }, 2000, 0);
+    try std.testing.expectEqualStrings("final protocol=tcp elapsed_ms=2000 accepted=4 completions=9 receives=5 sends=4 bytes=1048576 MiB_per_sec=0.50 active=0\n", output);
 }

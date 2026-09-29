@@ -4,8 +4,7 @@ const c = sdk.c;
 const types = @import("types.zig");
 const options_mod = @import("options.zig");
 const win32 = @import("win32.zig");
-const rio = @import("rio.zig");
-const udp = @import("udp.zig");
+const engine = @import("engine.zig");
 
 var stop_requested = std.atomic.Value(bool).init(false);
 
@@ -18,12 +17,12 @@ fn consoleHandler(kind: c.DWORD) callconv(.winapi) c.BOOL {
 }
 
 fn help() void {
-    std.debug.print(
-        "Usage: zig-echo-server /p udp [/s port] [/w seconds] [/b bytes] [/k udp-depth]\n" ++
-            "       [/cq capacity] [/memory bytes] [/rio-buffer bytes] [/q] [/stats]\n" ++
-            "TCP modules are the next migration slice; this build implements the production RIO/IOCP UDP path.\n",
-        .{},
-    );
+    const text =
+        "Usage: zig-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]\n" ++
+        "       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]\n" ++
+        "       [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
+        "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
+    if (!win32.writeStdout(text)) win32.failFast("write help", c.GetLastError());
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -32,7 +31,10 @@ pub fn main(init: std.process.Init) u8 {
     var error_buffer: [256]u8 = @splat(0);
     var options: types.Options = undefined;
     if (!options_mod.parseProcessArgs(init.minimal.args, arena_state.allocator(), &options, &error_buffer)) {
-        std.debug.print("Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)});
+        var message_buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&message_buffer, "Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)}) catch
+            win32.failFast("format argument error", c.ERROR_INSUFFICIENT_BUFFER);
+        if (!win32.writeStderr(message)) win32.failFast("write argument error", c.GetLastError());
         help();
         return @backingInt(types.ExitCode.usage);
     }
@@ -40,11 +42,6 @@ pub fn main(init: std.process.Init) u8 {
         help();
         return 0;
     }
-    if (options.protocol != .udp) {
-        std.debug.print("This code drop currently enables the UDP RIO path; TCP/AcceptEx is intentionally not stubbed with a fallback.\n", .{});
-        return @backingInt(types.ExitCode.usage);
-    }
-
     stop_requested.store(false, .release);
     if (c.SetConsoleCtrlHandler(consoleHandler, c.TRUE) == c.FALSE) {
         win32.report("SetConsoleCtrlHandler", @intCast(c.GetLastError()));
@@ -52,12 +49,5 @@ pub fn main(init: std.process.Init) u8 {
     }
     defer _ = c.SetConsoleCtrlHandler(consoleHandler, c.FALSE);
 
-    var winsock = win32.Winsock.init() catch {
-        win32.report("WSAStartup", @intCast(c.WSAGetLastError()));
-        return @backingInt(types.ExitCode.network);
-    };
-    defer winsock.deinit();
-
-    var api = rio.Api.load() catch return @backingInt(types.ExitCode.network);
-    return @backingInt(udp.run(&api, &options, &stop_requested));
+    return @backingInt(engine.runServer(&options, &stop_requested));
 }
