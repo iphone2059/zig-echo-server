@@ -88,6 +88,7 @@ pub const AcceptOperation = struct {
     overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
     owner: ?*Acceptor = null,
     socket: c.SOCKET = c.INVALID_SOCKET,
+    socket_owner: win32.Socket = .{},
     accept_port: c.HANDLE = null,
     state: AcceptState = .idle,
     index: u32 = 0,

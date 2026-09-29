@@ -5,6 +5,7 @@ const rio = server.rio;
 const c = win32.c;
 const timer_heap = server.timer_heap;
 const internal = server.engine_internal;
+const tcp_worker = server.tcp_worker;
 
 test "Win32 owner transfer and reset are idempotent" {
     var socket: win32.Socket = .{};
@@ -214,4 +215,97 @@ test "published request and accept contexts validate stable owner ranges" {
     accepts[0].owner = &acceptor;
     try std.testing.expect(internal.acceptContextValid(&accepts[0], &accepts, &acceptor));
     try std.testing.expect(!internal.acceptContextValid(&accepts[1], &accepts, &acceptor));
+}
+
+test "TCP worker capacity is bounded by CQ and per-worker registered memory" {
+    var options: server.types.Options = .{
+        .rio_buffer_bytes = 4096,
+        .cq_capacity = 1024,
+        .memory_bytes = 4096 * 100,
+    };
+    try std.testing.expectEqual(@as(?u32, 50), tcp_worker.connectionCapacity(&options, 2));
+    options.memory_bytes = 4096 * 8;
+    try std.testing.expectEqual(@as(?u32, 1), tcp_worker.connectionCapacity(&options, 8));
+    options.memory_bytes = 0;
+    try std.testing.expectEqual(@as(?u32, null), tcp_worker.connectionCapacity(&options, 8));
+}
+
+test "TCP worker free stack exhausts and restores exact connection index" {
+    var connections: [2]internal.Connection = .{ .{ .index = 0 }, .{ .index = 1 } };
+    var free_indices: [2]u32 = .{ 0, 1 };
+    var worker: internal.Worker = .{
+        .connections = &connections,
+        .free_indices = &free_indices,
+        .slot_count = 2,
+        .free_count = 2,
+    };
+    const first = tcp_worker.acquireConnection(&worker).?;
+    const second = tcp_worker.acquireConnection(&worker).?;
+    try std.testing.expectEqual(@as(u32, 1), first.index);
+    try std.testing.expectEqual(@as(u32, 0), second.index);
+    try std.testing.expect(tcp_worker.acquireConnection(&worker) == null);
+    tcp_worker.restoreConnection(&worker, first);
+    try std.testing.expectEqual(first, tcp_worker.acquireConnection(&worker).?);
+}
+
+test "TCP worker rejects foreign completion request contexts" {
+    var connections: [1]internal.Connection = .{. { .index = 0 }};
+    var worker: internal.Worker = .{ .connections = &connections, .slot_count = 1 };
+    connections[0].owner = &worker;
+    connections[0].request.connection = &connections[0];
+    try std.testing.expect(tcp_worker.completionContextValid(&worker, &connections[0].request));
+
+    var foreign: internal.Connection = .{};
+    foreign.owner = &worker;
+    foreign.request.connection = &foreign;
+    try std.testing.expect(!tcp_worker.completionContextValid(&worker, &foreign.request));
+}
+
+test "TCP worker completion progress closes on EOF and preserves partial sends" {
+    var connection: internal.Connection = .{};
+    try std.testing.expectEqual(tcp_worker.Progress.close, tcp_worker.applySuccessfulProgress(&connection, .receive, 0));
+    try std.testing.expectEqual(tcp_worker.Progress.post_send, tcp_worker.applySuccessfulProgress(&connection, .receive, 11));
+    try std.testing.expectEqual(@as(usize, 11), connection.echo_bytes);
+    try std.testing.expectEqual(@as(usize, 0), connection.send_offset);
+    try std.testing.expectEqual(tcp_worker.Progress.post_send, tcp_worker.applySuccessfulProgress(&connection, .send, 4));
+    try std.testing.expectEqual(@as(usize, 4), connection.send_offset);
+    try std.testing.expectEqual(tcp_worker.Progress.post_receive, tcp_worker.applySuccessfulProgress(&connection, .send, 7));
+    try std.testing.expectEqual(@as(usize, 0), connection.send_offset);
+}
+
+test "TCP worker refreshes and expires idle deadlines exactly" {
+    var connection: internal.Connection = .{};
+    tcp_worker.refreshDeadline(&connection, 9000, 3);
+    try std.testing.expectEqual(@as(u64, 12000), connection.deadline);
+    try std.testing.expect(!tcp_worker.deadlineExpired(&connection, 11999));
+    try std.testing.expect(tcp_worker.deadlineExpired(&connection, 12000));
+}
+
+test "TCP worker arms RIO notification before ready and drains control shutdown" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const api = try rio.Api.load();
+    var options: server.types.Options = .{
+        .protocol = .tcp,
+        .worker_count = 1,
+        .rio_buffer_bytes = 4096,
+        .cq_capacity = 64,
+        .memory_bytes = 1024 * 1024,
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    var worker: internal.Worker = .{};
+    var resources: tcp_worker.WorkerResources = .{};
+    try std.testing.expect(tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &resources));
+    defer tcp_worker.destroyWorker(&worker);
+    try std.testing.expect(tcp_worker.startWorker(&worker));
+    try std.testing.expect(worker.ready);
+    try std.testing.expect(worker.notification_armed);
+    tcp_worker.postStop(&worker);
+    tcp_worker.postAdmissionClosed(&worker);
+    tcp_worker.joinWorker(&worker);
+    try std.testing.expect(worker.stopping);
+    try std.testing.expect(worker.admission_closed);
+    try std.testing.expect(!worker.notification_armed);
+    try std.testing.expectEqual(@as(u32, 0), worker.active_count);
+    try std.testing.expect(!failed.load(.acquire));
 }

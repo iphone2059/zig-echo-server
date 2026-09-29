@@ -42,6 +42,7 @@ pub const c = struct {
     pub const ERROR_IO_INCOMPLETE: DWORD = 996;
     pub const ERROR_INVALID_STATE: DWORD = 5023;
     pub const WAIT_TIMEOUT: DWORD = 258;
+    pub const WAIT_OBJECT_0: DWORD = 0;
     pub const INFINITE: DWORD = 0xffffffff;
 
     pub const MEM_COMMIT: DWORD = 0x1000;
@@ -189,6 +190,11 @@ pub const c = struct {
     pub extern fn CreateIoCompletionPort(file_handle: HANDLE, existing_port: HANDLE, completion_key: ULONG_PTR, concurrent_threads: DWORD) callconv(.winapi) HANDLE;
     pub extern fn GetQueuedCompletionStatus(port: HANDLE, bytes: *DWORD, completion_key: *ULONG_PTR, overlapped: *[*c]OVERLAPPED, milliseconds: DWORD) callconv(.winapi) BOOL;
     pub extern fn PostQueuedCompletionStatus(port: HANDLE, bytes: DWORD, completion_key: ULONG_PTR, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+    pub extern fn CreateEventW(attributes: ?*anyopaque, manual_reset: BOOL, initial_state: BOOL, name: ?[*:0]const u16) callconv(.winapi) HANDLE;
+    pub extern fn SetEvent(event: HANDLE) callconv(.winapi) BOOL;
+    pub extern fn WaitForSingleObject(handle: HANDLE, milliseconds: DWORD) callconv(.winapi) DWORD;
+    pub extern fn CreateThread(attributes: ?*anyopaque, stack_size: usize, start: *const fn (?*anyopaque) callconv(.winapi) DWORD, parameter: ?*anyopaque, flags: DWORD, thread_id: ?*DWORD) callconv(.winapi) HANDLE;
+    pub extern fn getpeername(socket: SOCKET, address: *SOCKADDR, address_length: *c_int) callconv(.winapi) c_int;
     pub extern fn GetTickCount64() callconv(.winapi) u64;
     pub extern fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
     pub extern fn QueryPerformanceCounter(value: *LARGE_INTEGER) callconv(.winapi) BOOL;

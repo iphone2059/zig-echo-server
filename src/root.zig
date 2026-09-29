@@ -7,6 +7,7 @@ pub const win32 = @import("win32.zig");
 pub const rio = @import("rio.zig");
 pub const udp = @import("udp.zig");
 pub const engine_internal = @import("engine_internal.zig");
+pub const tcp_worker = @import("tcp_worker.zig");
 
 test {
     _ = types;
@@ -18,4 +19,5 @@ test {
     _ = rio;
     _ = udp;
     _ = engine_internal;
+    _ = tcp_worker;
 }
