@@ -57,4 +57,16 @@ pub fn build(b: *std.Build) void {
 
     const acceptance_step = b.step("acceptance", "Run the currently available acceptance suite");
     acceptance_step.dependOn(&run_tests.step);
+
+    const contract_module = b.createModule(.{
+        .root_source_file = b.path("tests/contracts.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    contract_module.addImport("server", test_module);
+    const contract_tests = b.addTest(.{ .root_module = contract_module });
+    const run_contract_tests = b.addRunArtifact(contract_tests);
+    const contract_step = b.step("test-contracts", "Run exact server CLI and pure contract tests");
+    contract_step.dependOn(&run_contract_tests.step);
 }

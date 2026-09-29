@@ -29,3 +29,4 @@ pub const Options = struct {
 };
 
 pub const max_udp_payload: u32 = 65507;
+pub const error_capacity: usize = 256;

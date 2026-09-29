@@ -30,11 +30,12 @@ pub fn main(init: std.process.Init) u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     var error_buffer: [256]u8 = @splat(0);
-    const options = options_mod.parse(init.minimal.args, arena_state.allocator(), &error_buffer) catch {
+    var options: types.Options = undefined;
+    if (!options_mod.parseProcessArgs(init.minimal.args, arena_state.allocator(), &options, &error_buffer)) {
         std.debug.print("Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)});
         help();
         return @backingInt(types.ExitCode.usage);
-    };
+    }
     if (options.help) {
         help();
         return 0;
