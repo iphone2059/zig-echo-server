@@ -10,6 +10,7 @@ Independent Windows TCP/UDP echo server rewritten from `cpp-echo-server` in Zig.
 - PowerShell 7 for the full integration suite
 
 The project owns its Win32/RIO ABI declarations and all implementation code. It has no source or build dependency on any client or sibling echo project. The default acceptance suite uses local .NET loopback peers; the separately built C++ client is an optional external interoperability peer.
+This pinned Zig 0.17-dev snapshot has removed `@cImport`, so the project-private declarations are checked against a Microsoft SDK-compiled ABI probe in the default suite.
 
 ## Build
 
@@ -54,7 +55,7 @@ Run the complete Debug and optimized gates:
 .\build.ps1 ReleaseFast
 ```
 
-The self-contained suite covers CLI contracts, timer/reference models, native resource ownership, real RIO-CQ-to-IOCP worker lifecycle, AcceptEx ownership transitions, split TCP I/O, capacity exhaustion and reuse, idle timeout, a connection storm overlapping shutdown, TCP/UDP loopback echo including 65507-byte datagrams, deterministic exit-4 production-guard boundaries, and source-policy rejection of fallback APIs or cross-project imports.
+The self-contained suite covers CLI contracts, timer/reference models, Microsoft SDK ABI and native resource ownership, real RIO-CQ-to-IOCP worker lifecycle, AcceptEx ownership transitions, split TCP I/O, capacity exhaustion and reuse, idle timeout, a connection storm overlapping shutdown, TCP/UDP loopback echo including 65507-byte datagrams, deterministic exit-4 production-guard boundaries, and source-policy rejection of fallback APIs or cross-project imports.
 
 Individual integration gates can also be run after a build:
 

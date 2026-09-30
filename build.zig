@@ -138,15 +138,31 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(fault_driver);
 
+    const abi_module = b.createModule(.{
+        .root_source_file = b.path("tests/sdk_abi_driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    abi_module.addImport("server", test_module);
+    const abi_driver = b.addExecutable(.{
+        .name = "zig-echo-server-sdk-abi-driver",
+        .root_module = abi_module,
+    });
+    b.installArtifact(abi_driver);
+
     const source_policy = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/source_policy.ps1" });
     const fault_process = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/fault_process_tests.ps1" });
     const process_tests = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
+    const abi_contract = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/sdk_abi_contract.ps1" });
     fault_process.step.dependOn(b.getInstallStep());
     process_tests.step.dependOn(b.getInstallStep());
+    abi_contract.step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_contract_tests.step);
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_stream_driver.step);
     test_step.dependOn(&source_policy.step);
     test_step.dependOn(&fault_process.step);
     test_step.dependOn(&process_tests.step);
+    test_step.dependOn(&abi_contract.step);
 }

@@ -21,6 +21,8 @@ try {
 
     $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("zig-echo-server-toolchain-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
+    $savedZigExe = $env:ZIG_EXE
+    $savedPath = $env:PATH
     try {
         $fakeZig = Join-Path $fixtureRoot 'zig.cmd'
         Set-Content -LiteralPath $fakeZig -Encoding Ascii -Value "@echo 0.17.0-dev.invalid"
@@ -31,9 +33,22 @@ try {
         if ($output -notmatch [regex]::Escape($requiredVersion)) {
             throw "Version rejection did not name the required compiler: $output"
         }
+        $env:ZIG_EXE = $fakeZig
+        $output = & pwsh -NoProfile -File (Join-Path $projectRoot 'build.ps1') -Optimize Debug -BuildOnly 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -or $output -notmatch [regex]::Escape($requiredVersion)) { throw "ZIG_EXE discovery did not reject a mismatch: $output" }
+        $env:ZIG_EXE = $null
+        $env:PATH = "$fixtureRoot;$savedPath"
+        $output = & pwsh -NoProfile -File (Join-Path $projectRoot 'build.ps1') -Optimize Debug -BuildOnly 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -or $output -notmatch [regex]::Escape($requiredVersion)) { throw "PATH discovery did not reject a mismatch: $output" }
     }
     finally {
-        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force
+        $env:ZIG_EXE = $savedZigExe
+        $env:PATH = $savedPath
+        $resolvedFixture = (Resolve-Path -LiteralPath $fixtureRoot).Path
+        if ($resolvedFixture.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($resolvedFixture) -like 'zig-echo-server-toolchain-*') {
+            Remove-Item -LiteralPath $resolvedFixture -Recurse -Force
+        } else { throw "Refusing to remove unexpected fixture: $resolvedFixture" }
     }
 
     Write-Host 'toolchain_contract: PASS'

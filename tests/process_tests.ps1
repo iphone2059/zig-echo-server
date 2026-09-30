@@ -238,9 +238,9 @@ try {
         } finally { $load.Dispose() }
     }
     if (-not $stopProcess.WaitForExit(10000)) { throw 'UDP external stop under load did not converge.' }
-    if ($stopProcess.ExitCode -ne 0) { throw "UDP external-stop driver failed with exit code $($stopProcess.ExitCode)." }
     $stopError = Get-Content -Raw -LiteralPath $stopStderr
     $stopOutput = Get-Content -Raw -LiteralPath $stopStdout
+    if ($stopProcess.ExitCode -ne 0) { throw "UDP external-stop driver failed with exit code $($stopProcess.ExitCode). stdout: $stopOutput stderr: $stopError" }
     if ($stopError.Length -ne 0) { throw "UDP external-stop path wrote to stderr: $stopError" }
     if ($stopOutput -notmatch $pattern) { throw "UDP external-stop statistics mismatch: $stopOutput" }
     Write-Host 'udp_process_tests: PASS'

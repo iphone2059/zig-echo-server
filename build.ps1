@@ -2,13 +2,21 @@ param(
     [ValidateSet('Debug', 'ReleaseFast')]
     [string]$Optimize = 'ReleaseFast',
 
-    [string]$ZigPath = 'C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe',
+    [string]$ZigPath,
 
     [switch]$BuildOnly
 )
 
 $ErrorActionPreference = 'Stop'
 $requiredVersion = '0.17.0-dev.2320+1e770dbef'
+if (-not $ZigPath) {
+    if ($env:ZIG_EXE) {
+        $ZigPath = $env:ZIG_EXE
+    } else {
+        $fromPath = Get-Command zig -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $ZigPath = if ($fromPath) { $fromPath.Source } else { 'C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe' }
+    }
+}
 
 $resolvedZig = (Resolve-Path -LiteralPath $ZigPath -ErrorAction Stop).Path
 $actualVersion = (& $resolvedZig version | Out-String).Trim()
