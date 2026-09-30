@@ -50,6 +50,38 @@ test "RIO table validation rejects missing entries and accepts loaded table" {
     try std.testing.expect(rio.Api.tableComplete(&api.table));
 }
 
+test "server closes idle CQ with an armed and already queued notification" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const api = try rio.Api.load();
+    var port = win32.Handle{ .value = c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1) };
+    defer port.deinit();
+    try std.testing.expect(port.value != null);
+    var notification_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
+    var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
+    notification.Type = c.RIO_IOCP_COMPLETION;
+    notification.Iocp.IocpHandle = port.value;
+    notification.Iocp.CompletionKey = @ptrCast(&notification_overlapped);
+    notification.Iocp.Overlapped = &notification_overlapped;
+    var cq = rio.CompletionQueue{ .api = &api, .value = api.createCq(8, &notification) };
+    defer cq.deinit();
+    try std.testing.expect(cq.value != c.RIO_INVALID_CQ);
+    try std.testing.expectEqual(@as(c_int, c.ERROR_SUCCESS), api.notify(cq.value));
+    var armed = true;
+    try std.testing.expect(c.PostQueuedCompletionStatus(port.value, 0, @intFromPtr(&notification_overlapped), &notification_overlapped) != c.FALSE);
+
+    rio.retireCompletionQueue(&cq, 0, &armed);
+
+    try std.testing.expectEqual(c.RIO_INVALID_CQ, cq.value);
+    try std.testing.expect(!armed);
+    var transferred: c.DWORD = 0;
+    var key: c.ULONG_PTR = 0;
+    var overlapped: [*c]c.OVERLAPPED = null;
+    try std.testing.expect(c.GetQueuedCompletionStatus(port.value, &transferred, &key, &overlapped, 0) != c.FALSE);
+    try std.testing.expectEqual(@intFromPtr(&notification_overlapped), key);
+    try std.testing.expect(overlapped == &notification_overlapped);
+}
+
 test "project-private Windows ABI declarations retain required sizes" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(c.GUID));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(c.RIO_BUF));
@@ -251,7 +283,7 @@ test "TCP worker free stack exhausts and restores exact connection index" {
 }
 
 test "TCP worker rejects foreign completion request contexts" {
-    var connections: [1]internal.Connection = .{. { .index = 0 }};
+    var connections: [1]internal.Connection = .{.{ .index = 0 }};
     var worker: internal.Worker = .{ .connections = &connections, .slot_count = 1 };
     connections[0].owner = &worker;
     connections[0].request.connection = &connections[0];

@@ -211,20 +211,7 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
         }
     }
 
-    if (armed) {
-        if (c.PostQueuedCompletionStatus(port.value, 0, 0, &notification_overlapped) == c.FALSE)
-            win32.failFast("PostQueuedCompletionStatus(UDP notification shutdown)", @intCast(c.GetLastError()));
-        var transferred: c.DWORD = 0;
-        var key: c.ULONG_PTR = 0;
-        var overlapped: [*c]c.OVERLAPPED = null;
-        if (c.GetQueuedCompletionStatus(port.value, &transferred, &key, &overlapped, 1000) == c.FALSE)
-            win32.failFast("GetQueuedCompletionStatus(UDP notification shutdown)", @intCast(c.GetLastError()));
-        if (key != 0 or overlapped != &notification_overlapped)
-            win32.failFast("UDP notification shutdown packet", c.ERROR_INVALID_DATA);
-        if (!contract.notificationMarkDelivered(&armed))
-            win32.failFast("UDP notification shutdown transition", c.ERROR_INVALID_STATE);
-    }
-    if (outstanding != 0) win32.failFast("UDP cleanup with outstanding operations", c.ERROR_IO_INCOMPLETE);
+    rio_mod.retireCompletionQueue(&cq, outstanding, &armed);
 
     if (options.stats) {
         const elapsed = @max(@as(u64, 1), c.GetTickCount64() - start);

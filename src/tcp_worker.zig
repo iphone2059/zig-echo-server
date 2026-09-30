@@ -296,19 +296,10 @@ fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
         if (worker.stopping and worker.admission_closed and worker.active_count == 0) break;
     }
 
-    if (worker.notification_armed) {
-        if (c.PostQueuedCompletionStatus(worker.port, 0, 0, &worker.notification_overlapped) == c.FALSE)
-            win32.failFast("PostQueuedCompletionStatus(worker notification shutdown)", c.GetLastError());
-        var transferred: c.DWORD = 0;
-        var key: c.ULONG_PTR = 0;
-        var overlapped: [*c]c.OVERLAPPED = null;
-        if (c.GetQueuedCompletionStatus(worker.port, &transferred, &key, &overlapped, 1000) == c.FALSE)
-            win32.failFast("GetQueuedCompletionStatus(worker notification shutdown)", c.GetLastError());
-        if (!internal.notificationPacketMatches(key, overlapped, 0, &worker.notification_overlapped))
-            win32.failFast("worker notification shutdown packet", c.ERROR_INVALID_DATA);
-        if (!contract.notificationMarkDelivered(&worker.notification_armed))
-            win32.failFast("notification shutdown transition", c.ERROR_INVALID_STATE);
-    }
+    var outstanding: u32 = 0;
+    for (worker.connections.?[0..worker.slot_count]) |connection| outstanding += connection.outstanding;
+    rio.retireCompletionQueue(&resources(worker).completion_queue, outstanding, &worker.notification_armed);
+    worker.completion_queue = c.RIO_INVALID_CQ;
     return if (worker.failed.?.load(.acquire)) 1 else 0;
 }
 

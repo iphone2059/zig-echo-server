@@ -154,3 +154,10 @@ pub const CompletionQueue = struct {
         self.value = c.RIO_INVALID_CQ;
     }
 };
+
+pub fn retireCompletionQueue(queue: *CompletionQueue, outstanding: u32, notification_armed: *bool) void {
+    if (outstanding != 0) win32.failFast("RIO CQ retirement with outstanding operations", c.ERROR_IO_INCOMPLETE);
+    if (queue.value == c.RIO_INVALID_CQ) win32.failFast("RIO CQ retirement ownership", c.ERROR_INVALID_STATE);
+    queue.deinit();
+    notification_armed.* = false;
+}
