@@ -55,8 +55,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run contract and heap tests");
     test_step.dependOn(&run_tests.step);
 
-    const acceptance_step = b.step("acceptance", "Run the currently available acceptance suite");
-    acceptance_step.dependOn(&run_tests.step);
+    const acceptance_step = b.step("acceptance", "Run the complete self-contained server acceptance suite");
+    acceptance_step.dependOn(test_step);
 
     const contract_module = b.createModule(.{
         .root_source_file = b.path("tests/contracts.zig"),

@@ -3,6 +3,7 @@ const win32 = @import("win32.zig");
 const c = win32.c;
 const rio_mod = @import("rio.zig");
 const contract = @import("contract.zig");
+const fault_guards = @import("fault_guards.zig");
 const types = @import("types.zig");
 const internal = @import("engine_internal.zig");
 
@@ -22,8 +23,8 @@ fn arm(api: *const rio_mod.Api, cq: c.RIO_CQ, overlapped: *c.OVERLAPPED, armed: 
     if (armed.*) win32.failFast("duplicate UDP RIONotify", c.ERROR_INVALID_STATE);
     overlapped.* = std.mem.zeroes(c.OVERLAPPED);
     const status = api.notify(cq);
-    if (status != c.ERROR_SUCCESS) win32.failFast("RIONotify(UDP)", @intCast(status));
-    if (!contract.notificationMarkRearmed(armed)) win32.failFast("UDP notification rearm transition", c.ERROR_INVALID_STATE);
+    fault_guards.requireNotifySuccess(status, "RIONotify(UDP)");
+    fault_guards.requireTransition(contract.notificationMarkRearmed(armed), "UDP notification rearm transition");
 }
 
 pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.atomic.Value(bool)) types.ExitCode {
@@ -149,11 +150,10 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
         if (overlapped == &notification_overlapped) {
             if (ok == c.FALSE) win32.failFast("GetQueuedCompletionStatus(UDP notification)", err);
             if (key != @intFromPtr(slots.ptr)) win32.failFast("UDP RIO notification key", c.ERROR_INVALID_DATA);
-            if (!contract.notificationMarkDelivered(&armed)) win32.failFast("UDP notification delivery transition", c.ERROR_INVALID_STATE);
+            fault_guards.requireTransition(contract.notificationMarkDelivered(&armed), "UDP notification delivery transition");
 
             while (true) {
-                const count = api.dequeue(cq.value, &results, batch_size);
-                if (count == c.RIO_CORRUPT_CQ) win32.failFast("RIODequeueCompletion(UDP)", c.ERROR_INVALID_DATA);
+                const count = fault_guards.requireDequeueCount(api.dequeue(cq.value, &results, batch_size), batch_size, "RIODequeueCompletion(UDP)");
                 if (count == 0) break;
                 for (results[0..count]) |result| {
                     const raw = result.RequestContext orelse win32.failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);

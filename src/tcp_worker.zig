@@ -1,5 +1,6 @@
 const std = @import("std");
 const contract = @import("contract.zig");
+const fault_guards = @import("fault_guards.zig");
 const internal = @import("engine_internal.zig");
 const rio = @import("rio.zig");
 const timer_heap = @import("timer_heap.zig");
@@ -86,9 +87,8 @@ fn arm(worker: *internal.Worker) void {
     if (worker.notification_armed) win32.failFast("duplicate worker RIONotify", c.ERROR_INVALID_STATE);
     worker.notification_overlapped = std.mem.zeroes(c.OVERLAPPED);
     const status = worker.rio_api.?.notify(worker.completion_queue);
-    if (status != c.ERROR_SUCCESS) win32.failFast("RIONotify(worker)", @intCast(status));
-    if (!contract.notificationMarkRearmed(&worker.notification_armed))
-        win32.failFast("notification rearm transition", c.ERROR_INVALID_STATE);
+    fault_guards.requireNotifySuccess(status, "RIONotify(worker)");
+    fault_guards.requireTransition(contract.notificationMarkRearmed(&worker.notification_armed), "notification rearm transition");
 }
 
 fn closeSocket(connection: *internal.Connection) void {
@@ -180,8 +180,7 @@ fn processResult(worker: *internal.Worker, result: c.RIORESULT) void {
 fn drain(worker: *internal.Worker) void {
     var results: [batch_size]c.RIORESULT = undefined;
     while (true) {
-        const count = worker.rio_api.?.dequeue(worker.completion_queue, &results, batch_size);
-        if (count == c.RIO_CORRUPT_CQ) win32.failFast("RIODequeueCompletion(worker)", c.ERROR_INVALID_DATA);
+        const count = fault_guards.requireDequeueCount(worker.rio_api.?.dequeue(worker.completion_queue, &results, batch_size), batch_size, "RIODequeueCompletion(worker)");
         if (count == 0) return;
         for (results[0..count]) |result| processResult(worker, result);
     }
@@ -271,8 +270,7 @@ fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
             if (ok == c.FALSE) win32.failFast("GetQueuedCompletionStatus(worker notification)", native_error);
             if (!internal.notificationPacketMatches(key, overlapped, @intFromPtr(worker), &worker.notification_overlapped))
                 win32.failFast("worker RIO notification key", c.ERROR_INVALID_DATA);
-            if (!contract.notificationMarkDelivered(&worker.notification_armed))
-                win32.failFast("notification delivery transition", c.ERROR_INVALID_STATE);
+            fault_guards.requireTransition(contract.notificationMarkDelivered(&worker.notification_armed), "notification delivery transition");
             drain(worker);
             arm(worker);
         } else if (overlapped == null and key == stop_key) {
@@ -434,8 +432,8 @@ pub fn postAdmissionClosed(worker: *internal.Worker) void {
 }
 
 pub fn postStop(worker: *internal.Worker) void {
-    if (c.PostQueuedCompletionStatus(worker.port, 0, stop_key, null) == c.FALSE)
-        win32.failFast("PostQueuedCompletionStatus(worker stop)", c.GetLastError());
+    const ok = c.PostQueuedCompletionStatus(worker.port, 0, stop_key, null);
+    fault_guards.requireControlPost(ok, if (ok == c.FALSE) c.GetLastError() else 0, "PostQueuedCompletionStatus(worker stop)");
 }
 
 pub fn joinWorker(worker: *internal.Worker) void {
@@ -456,8 +454,8 @@ pub fn destroyWorker(worker: *internal.Worker) void {
     if (worker.options != null and worker.options.?.stats) {
         var buffer: [512]u8 = undefined;
         const output = std.fmt.bufPrint(&buffer, "[worker {d}] accepted={d} completions={d} receives={d} sends={d} bytes={d} active={d}\n", .{
-            worker.worker_index, worker.statistics.accepted, worker.statistics.completions, worker.statistics.receives,
-            worker.statistics.sends, worker.statistics.bytes, worker.active_count,
+            worker.worker_index,     worker.statistics.accepted, worker.statistics.completions, worker.statistics.receives,
+            worker.statistics.sends, worker.statistics.bytes,    worker.active_count,
         }) catch win32.failFast("format worker statistics", c.ERROR_INSUFFICIENT_BUFFER);
         if (!win32.writeStdout(output)) win32.failFast("write worker statistics", c.GetLastError());
     }

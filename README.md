@@ -9,7 +9,7 @@ Independent Windows TCP/UDP echo server rewritten from `cpp-echo-server` in Zig.
 - Visual Studio C++ tools and Windows SDK
 - PowerShell 7 for the full integration suite
 
-The project owns its Win32/RIO ABI declarations and all implementation code. It has no source or build dependency on any client or sibling echo project. The acceptance script may launch the separately built C++ client as an external interoperability peer.
+The project owns its Win32/RIO ABI declarations and all implementation code. It has no source or build dependency on any client or sibling echo project. The default acceptance suite uses local .NET loopback peers; the separately built C++ client is an optional external interoperability peer.
 
 ## Build
 
@@ -54,7 +54,7 @@ Run the complete Debug and optimized gates:
 .\build.ps1 ReleaseFast
 ```
 
-The suite covers CLI contracts, timer/reference models, native resource ownership, real RIO-CQ-to-IOCP worker lifecycle, AcceptEx ownership transitions, split TCP I/O, capacity exhaustion and reuse, idle timeout, connection storms, C++ client interoperability for TCP and UDP including 65507-byte datagrams, deterministic exit-4 failure boundaries, and source-policy rejection of fallback APIs or cross-project imports.
+The self-contained suite covers CLI contracts, timer/reference models, native resource ownership, real RIO-CQ-to-IOCP worker lifecycle, AcceptEx ownership transitions, split TCP I/O, capacity exhaustion and reuse, idle timeout, a connection storm overlapping shutdown, TCP/UDP loopback echo including 65507-byte datagrams, deterministic exit-4 production-guard boundaries, and source-policy rejection of fallback APIs or cross-project imports.
 
 Individual integration gates can also be run after a build:
 
@@ -62,4 +62,11 @@ Individual integration gates can also be run after a build:
 pwsh -NoProfile -File .\tests\process_tests.ps1
 pwsh -NoProfile -File .\tests\fault_process_tests.ps1
 pwsh -NoProfile -File .\tests\source_policy.ps1
+```
+
+Optional C++ client interoperability (after separately building that executable):
+
+```powershell
+pwsh -NoProfile -File .\tests\process_tests.ps1 `
+  -CppClientPath ..\cpp-echo-client\build\release\cpp-echo-client.exe
 ```

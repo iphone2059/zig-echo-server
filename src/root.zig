@@ -4,6 +4,7 @@ pub const contract = @import("contract.zig");
 pub const timer_heap = @import("timer_heap.zig");
 pub const sdk = @import("sdk.zig");
 pub const win32 = @import("win32.zig");
+pub const fault_guards = @import("fault_guards.zig");
 pub const rio = @import("rio.zig");
 pub const udp = @import("udp.zig");
 pub const engine_internal = @import("engine_internal.zig");
