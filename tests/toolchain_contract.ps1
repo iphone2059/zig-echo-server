@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$requiredVersion = '0.17.0-dev.2320+1e770dbef'
+$requiredVersion = '0.17.0-dev.2375+d8aab4878'
 
 Push-Location $projectRoot
 try {
