@@ -155,6 +155,7 @@ pub fn build(b: *std.Build) void {
     const fault_process = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/fault_process_tests.ps1" });
     const process_tests = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/process_tests.ps1" });
     const interop_child_lifecycle = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/interop_child_lifecycle_contract.ps1" });
+    const cpp_reference_contract = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/perf_cpp_reference_contract.ps1" });
     const abi_contract = b.addSystemCommand(&.{ "pwsh.exe", "-NoProfile", "-File", "tests/sdk_abi_contract.ps1" });
     fault_process.step.dependOn(b.getInstallStep());
     process_tests.step.dependOn(b.getInstallStep());
@@ -166,5 +167,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&fault_process.step);
     test_step.dependOn(&process_tests.step);
     test_step.dependOn(&interop_child_lifecycle.step);
+    test_step.dependOn(&cpp_reference_contract.step);
     test_step.dependOn(&abi_contract.step);
 }
