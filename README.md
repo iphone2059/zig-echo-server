@@ -5,7 +5,7 @@ Independent Windows TCP/UDP echo server rewritten from `cpp-echo-server` in Zig.
 ## Toolchain
 
 - Windows x64, MSVC ABI
-- Zig `0.17.0-dev.2320+1e770dbef`
+- Zig `0.17.0-dev.2375+d8aab4878`
 - Visual Studio C++ tools and Windows SDK
 - PowerShell 7 for the full integration suite
 
@@ -20,7 +20,7 @@ From the project root:
 .\build.ps1 ReleaseFast
 ```
 
-`build.ps1` requires Zig `0.17.0-dev.2320+1e770dbef`, discovers Visual Studio through `vswhere`, initializes the x64 MSVC/SDK environment, builds the executable, and runs the complete suite. Compiler selection is `-ZigPath`, then `ZIG_EXE`, then the pinned installation directory, then `PATH`; a version mismatch is rejected. Use `-BuildOnly` to omit tests.
+`build.ps1` requires Zig `0.17.0-dev.2375+d8aab4878`, discovers Visual Studio through `vswhere`, initializes the x64 MSVC/SDK environment, builds the executable, and runs the complete suite. Compiler selection is `-ZigPath`, then `ZIG_EXE`, then the pinned installation directory, then `PATH`; a version mismatch is rejected. Use `-BuildOnly` to omit tests.
 
 Artifacts are written to `zig-out\bin`.
 
