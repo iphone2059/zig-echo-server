@@ -43,6 +43,8 @@ These are sampled profile weights, not exact per-function CPU time or proof that
 
 **Task 4 — SKIPPED: no handoff evidence.** The resolved TCP trace has negligible `acceptorThread` weight relative to networking work. No worker-selection or handoff policy source change was made; the current 32-per-worker/max-1024 AcceptEx pool and exactly-once transit acknowledgement remain intact. The limitation is that this profile alone does not prove every possible admission imbalance absent on other hardware or workloads.
 
+**Task 5 — SKIPPED: no CQ/connection-layout hotspot evidence.** `workerThread` appears in the valid TCP trace, but the function bucket includes the whole worker loop; this sample does not isolate `RIODequeueCompletion`, timer handling, or any `Connection` field access as a dominant cost. Testing 128/512 against the unchanged CQ `batch_size=256`, or reorganizing stable request contexts, would be an ungrounded change. Both existing RIO CQ rearm ordering and partial-send/EOF tests remain green; no Task 5 source change was made.
+
 An existing independently built C++ server executable is available at `cpp-echo-server/build/release/cpp-echo-server.exe`, SHA-256 `393a0616c55faabdba6812f3b82bff6a8eda9bc13cfb6235fe505dae92f04d38`. Its exact build-source provenance was not established by the no-op incremental build, so it is not part of the Zig acceptance baseline or the table above. Cross-project interoperability will be tested separately.
 
 ## Candidate decisions
