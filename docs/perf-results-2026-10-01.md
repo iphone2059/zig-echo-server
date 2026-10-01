@@ -32,10 +32,19 @@ The initial baseline runner inferred `client_commit` from the current client wor
 
 ## Profiling and C++ reference
 
-`wpr -start CPU -filemode` failed before collection with `0xc5585011` (`Failed to enable the policy to profile system performance`). No CPU-stack profile or server-side hotspot evidence exists yet. Worker handoff, CQ batch size/connection layout, and UDP slot/repost changes remain profile-gated; do not invent a hotspot from throughput alone.
+The first `wpr -start CPU -filemode` attempt failed with `0xc5585011` (`Failed to enable the policy to profile system performance`). A later verbose/file-mode run wrote 9.5 GB but reported 69,894 dropped events, so it was rejected and that invalid, uncommitted ETL was deleted. Subsequent `CPU.light` memory-mode traces were valid: `xperf -a tracestats` reported **zero lost buffers and zero lost events** for both TCP and UDP. The candidate PDB was copied beside the immutable executable for function-symbol resolution.
+
+| Candidate trace | Workload | ETL bytes | SHA-256 | Selected `xperf -a profile -detail` sample weights |
+| --- | --- | ---: | --- | --- |
+| `zig-out/bench/profiles/server-tcp-light-2026-10-01.etl` | TCP 128 B `/k 1` | 201,326,592 | `4e48bfd63196e6b35fc290ccb873203da4d2c3687f488a39d6b5483b16485c62` | `workerThread` 1,057,253; `acceptorThread` 1,035; `ntoskrnl.exe` 115,177,236; `NETIO.SYS` 54,985,051; `tcpip.sys` 38,435,662 |
+| `zig-out/bench/profiles/server-udp-light-2026-10-01.etl` | UDP 65507 B | 260,046,848 | `99f23cfc80cd89b9ad285dc3ca116de7c0601387604a969802b47cb4708581a8` | inlined server `runServer` 96,070; `ntoskrnl.exe` 11,152,779; `NETIO.SYS` 11,818,889; `tcpip.sys` 5,211,271 |
+
+These are sampled profile weights, not exact per-function CPU time or proof that kernel internals can be optimized here. The valid traces were taken on the structurally refactored candidate because baseline WPR capture initially failed; the data-path/event policy did not change between those binaries. They provide no evidence that changing AcceptEx selection, CQ batch/connection layout, or UDP slot/repost logic is the next useful intervention.
+
+**Task 4 — SKIPPED: no handoff evidence.** The resolved TCP trace has negligible `acceptorThread` weight relative to networking work. No worker-selection or handoff policy source change was made; the current 32-per-worker/max-1024 AcceptEx pool and exactly-once transit acknowledgement remain intact. The limitation is that this profile alone does not prove every possible admission imbalance absent on other hardware or workloads.
 
 An existing independently built C++ server executable is available at `cpp-echo-server/build/release/cpp-echo-server.exe`, SHA-256 `393a0616c55faabdba6812f3b82bff6a8eda9bc13cfb6235fe505dae92f04d38`. Its exact build-source provenance was not established by the no-op incremental build, so it is not part of the Zig acceptance baseline or the table above. Cross-project interoperability will be tested separately.
 
 ## Candidate decisions
 
-Pending typed-owner and synchronous-initialization refactor, self-contained tests, interop, and comparable post-change validation. No optimization accepted, rejected, or claimed yet.
+Typed-owner and synchronous-initialization refactors are committed and passed Debug/ReleaseFast suites. Candidate benchmark and A/B/A decisions are being finalized below; no hot-path optimization is accepted or claimed yet.
