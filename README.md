@@ -20,7 +20,7 @@ From the project root:
 .\build.ps1 ReleaseFast
 ```
 
-`build.ps1` pins `C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe`, discovers Visual Studio through `vswhere`, initializes the x64 MSVC/SDK environment, builds the executable, and runs the complete suite. Use `-BuildOnly` to omit tests.
+`build.ps1` requires Zig `0.17.0-dev.2320+1e770dbef`, discovers Visual Studio through `vswhere`, initializes the x64 MSVC/SDK environment, builds the executable, and runs the complete suite. Compiler selection is `-ZigPath`, then `ZIG_EXE`, then the pinned installation directory, then `PATH`; a version mismatch is rejected. Use `-BuildOnly` to omit tests.
 
 Artifacts are written to `zig-out\bin`.
 

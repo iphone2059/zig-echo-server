@@ -9,12 +9,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $requiredVersion = '0.17.0-dev.2320+1e770dbef'
+$pinnedZig = 'C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe'
 if (-not $ZigPath) {
     if ($env:ZIG_EXE) {
         $ZigPath = $env:ZIG_EXE
+    } elseif (Test-Path -LiteralPath $pinnedZig -PathType Leaf) {
+        $ZigPath = $pinnedZig
     } else {
         $fromPath = Get-Command zig -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        $ZigPath = if ($fromPath) { $fromPath.Source } else { 'C:\bin\zig-x86_64-windows-0.17.0-dev.2320+1e770dbef\zig.exe' }
+        $ZigPath = if ($fromPath) { $fromPath.Source } else { $pinnedZig }
     }
 }
 

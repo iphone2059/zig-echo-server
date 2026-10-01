@@ -7,6 +7,19 @@ $ErrorActionPreference = 'Stop'
 $server = (Resolve-Path -LiteralPath $ServerPath).Path
 $client = if ($CppClientPath) { (Resolve-Path -LiteralPath $CppClientPath).Path } else { $null }
 
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, 0)
+    $listener.Start()
+    try { return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
+    finally { $listener.Stop() }
+}
+
+function Get-FreeUdpPort {
+    $socket = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0))
+    try { return ([System.Net.IPEndPoint]$socket.Client.LocalEndPoint).Port }
+    finally { $socket.Dispose() }
+}
+
 function Test-TcpEcho([int]$Port, [byte[]]$Payload, [int]$Count) {
     $tcp = [System.Net.Sockets.TcpClient]::new()
     try {
@@ -58,12 +71,12 @@ $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("zig-echo-server-udp-" +
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $stdoutPath = Join-Path $scratch 'server.stdout.txt'
 $stderrPath = Join-Path $scratch 'server.stderr.txt'
-$port = Get-Random -Minimum 20000 -Maximum 50000
+$port = Get-FreeUdpPort
 
 try {
     $serverTcpStdout = Join-Path $scratch 'server-tcp.stdout.txt'
     $serverTcpStderr = Join-Path $scratch 'server-tcp.stderr.txt'
-    $serverTcpPort = Get-Random -Minimum 20000 -Maximum 50000
+    $serverTcpPort = Get-FreeTcpPort
     $serverTcpProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'tcp', '/s', $serverTcpPort, '/threads', '2', '/t', '1', '/w', '3', '/rio-buffer', '4096', '/cq', '256', '/memory', '67108864', '/q', '/stats') -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverTcpStdout -RedirectStandardError $serverTcpStderr
     Start-Sleep -Milliseconds 400
     if ($serverTcpProcess.HasExited) { throw "TCP server exited during startup with code $($serverTcpProcess.ExitCode): $(Get-Content -Raw $serverTcpStderr)" }
@@ -86,7 +99,7 @@ try {
 
     $tcpStdout = Join-Path $scratch 'tcp.stdout.txt'
     $tcpStderr = Join-Path $scratch 'tcp.stderr.txt'
-    $tcpPort = Get-Random -Minimum 20000 -Maximum 50000
+    $tcpPort = Get-FreeTcpPort
     $tcpProcess = Start-Process -FilePath $tcpDriver -ArgumentList @($tcpPort, 6, 4, 8192, 1) -WindowStyle Hidden -PassThru -RedirectStandardOutput $tcpStdout -RedirectStandardError $tcpStderr
     Start-Sleep -Milliseconds 400
     if ($tcpProcess.HasExited) { throw "TCP acceptor driver exited during startup: $(Get-Content -Raw $tcpStderr)" }
@@ -216,7 +229,7 @@ try {
     if (-not (Test-Path -LiteralPath $stopDriver -PathType Leaf)) { throw "Missing UDP external-stop driver: $stopDriver" }
     $stopStdout = Join-Path $scratch 'stop.stdout.txt'
     $stopStderr = Join-Path $scratch 'stop.stderr.txt'
-    $stopPort = Get-Random -Minimum 20000 -Maximum 50000
+    $stopPort = Get-FreeUdpPort
     $stopProcess = Start-Process -FilePath $stopDriver -ArgumentList @($stopPort) -WindowStyle Hidden -PassThru -RedirectStandardOutput $stopStdout -RedirectStandardError $stopStderr
     Start-Sleep -Milliseconds 250
     if ($client) {

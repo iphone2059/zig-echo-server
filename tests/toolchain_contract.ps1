@@ -39,7 +39,7 @@ try {
         $env:ZIG_EXE = $null
         $env:PATH = "$fixtureRoot;$savedPath"
         $output = & pwsh -NoProfile -File (Join-Path $projectRoot 'build.ps1') -Optimize Debug -BuildOnly 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0 -or $output -notmatch [regex]::Escape($requiredVersion)) { throw "PATH discovery did not reject a mismatch: $output" }
+        if ($LASTEXITCODE -ne 0) { throw "Pinned installation was not preferred over a mismatched PATH compiler: $output" }
     }
     finally {
         $env:ZIG_EXE = $savedZigExe
