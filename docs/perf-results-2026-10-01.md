@@ -1,6 +1,6 @@
 # Zig echo server performance refactor: evidence log
 
-Status: implementation in progress. This document distinguishes correctness evidence, a baseline, and any later candidate result. No throughput or tail-latency improvement has yet been established.
+Status: the typed-ownership and pre-publication setup refactor is implemented and verified on the isolated implementation branch. The three profile-gated hot-path experiments were skipped for lack of path-specific evidence. No throughput or tail-latency improvement is claimed.
 
 ## Frozen baseline
 
@@ -45,8 +45,37 @@ These are sampled profile weights, not exact per-function CPU time or proof that
 
 **Task 5 — SKIPPED: no CQ/connection-layout hotspot evidence.** `workerThread` appears in the valid TCP trace, but the function bucket includes the whole worker loop; this sample does not isolate `RIODequeueCompletion`, timer handling, or any `Connection` field access as a dominant cost. Testing 128/512 against the unchanged CQ `batch_size=256`, or reorganizing stable request contexts, would be an ungrounded change. Both existing RIO CQ rearm ordering and partial-send/EOF tests remain green; no Task 5 source change was made.
 
+**Task 6 — SKIPPED: no UDP slot/repost hotspot evidence.** The valid 65507-byte UDP trace resolves very little CPU weight to server application code relative to Windows networking modules and does not isolate `UdpSlot` layout or receive repost as a bottleneck. No UDP source change was made. The existing maximum-datagram, recoverable receive-error and terminal `outstanding=0` tests remain in the full suite.
+
 An existing independently built C++ server executable is available at `cpp-echo-server/build/release/cpp-echo-server.exe`, SHA-256 `393a0616c55faabdba6812f3b82bff6a8eda9bc13cfb6235fe505dae92f04d38`. Its exact build-source provenance was not established by the no-op incremental build, so it is not part of the Zig acceptance baseline or the table above. Cross-project interoperability will be tested separately.
 
 ## Candidate decisions
 
-Typed-owner and synchronous-initialization refactors are committed and passed Debug/ReleaseFast suites. Candidate benchmark and A/B/A decisions are being finalized below; no hot-path optimization is accepted or claimed yet.
+The structural candidate source is `562d70f81619c83ffd713d17f2f49a40caef7b32`, immutable ReleaseFast server SHA-256 `dba4d34883f0fb9eded6c6a948a383c717b692dfc2863a4b51fff039cf4ecf07`. The peer is the **same** instrumented Zig client binary and SHA-256 used for the baseline. Each row below has seven valid baseline and seven valid candidate runs, exact echoed bytes, zero corruption/loss/network errors, and an independently verified server exit 0 with terminal TCP `active=0` or UDP `outstanding=0`. The original baseline 4096-session series with the failing seventh run is excluded; both compared 4096-session sets use seven separate server lifetimes.
+
+| Workload | Baseline median echoes/s ± MAD | Candidate median echoes/s ± MAD | Delta | Median batch p99 µs ~ (A→B) | Median batch p999 µs ~ (A→B) | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| TCP 128 B `/k 1` | 244,704 ± 4,707 | 252,984 ± 16,717 | +3.38% | 1,472→1,392 | 3,168→2,784 | Inconclusive |
+| TCP 4096 B `/k 8` | 1,066,845 ± 126,573 | 1,181,248 ± 25,335 | +10.72% | 3,872→3,232 | 7,360→4,736 | Inconclusive: below 3× baseline MAD |
+| UDP 1200 B | 137,004 ± 3,322 | 141,957 ± 2,122 | +3.62% | 2,112→2,080 | 2,720→2,912 | Inconclusive |
+| UDP 65507 B | 62,131 ± 821 | 64,735 ± 563 | +4.19% | 4,864→4,480 | 7,168→6,080 | Inconclusive: below 5% threshold |
+| TCP 128 B, 1024 sessions | 226,340 ± 2,595 | 221,147 ± 11,040 | −2.29% | 6,016→7,360 | 9,472→15,744 | Inconclusive; watch tail behavior |
+| TCP 128 B, 4096 sessions | 150,780 ± 2,985 | 204,813 ± 4,776 | +35.84% | 36,864→26,368 | 77,824→92,160 | Rejected as a performance claim after A/B/A |
+
+The acceptance threshold is `max(5% × baseline median, 3 × baseline MAD)` in echoes/s, with no meaningful tail regression elsewhere. No candidate constitutes an accepted hot-path optimization. The p99/p999 figures are coarse batch-level approximations, not a precise latency probe; none is a defensible tail-latency improvement claim. The 1024-session p999 increase and 4096-session p999 increase especially preclude claiming an unqualified latency win.
+
+The apparent 4096-session gain failed an immediate A/B/A check using the **original immutable baseline executable** on the same machine and workload with seven valid independently stopped runs per set:
+
+| Set | Median echoes/s | MAD echoes/s | Median elapsed ms | Median batch p99 µs ~ | Median batch p999 µs ~ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1, original baseline | 150,780 | 2,985 | 21,223 | 36,864 | 77,824 |
+| B, structural candidate | 204,813 | 4,776 | 15,624 | 26,368 | 92,160 |
+| A2, original baseline rerun | 212,922 | 6,390 | 15,029 | 23,808 | 84,992 |
+
+The unchanged A2 binary outperformed B; the earlier apparent gain was confounded by time-varying machine conditions. Candidate 4096-session seven-run **continuous-server** longevity also passed 7/7, whereas the earlier baseline continuous-server series failed on run 7. This is a non-reproduction, not proof of a fixed root cause.
+
+Raw candidate archive (six formal workloads plus the continuous-server longevity series): `zig-out/bench/candidate-562d70f/raw-samples-2026-10-01.zip`, SHA-256 `843100bdc60e457b0a000fd4d692875ac7f36c3921d9d20f2003e0f4217b3b26`. Raw A2 archive: `zig-out/bench/baseline/aba-recheck-2026-10-01.zip`, SHA-256 `98aac2ac1d8640ab2c59bf4267a51b1d865227367f4ce375c00b1961a1c6fd97`. Both are ignored local artifacts, not committed.
+
+The full pinned-2375 Debug and ReleaseFast suites pass, including TCP storm, capacity reuse, fault/process tests, UDP stop/drain and SDK ABI contract. External Zig and C++ clients each passed TCP `/k 8` full batch, TCP `100003` non-integral tail, UDP 1200 B, and UDP 65507 B against the candidate server (8/8). Each server ran without `/w`, then exited 0 after Ctrl+Break with terminal zero active/outstanding. The interop log archive is `zig-out/bench/candidate-562d70f/interop-logs-2026-10-01.zip`, SHA-256 `67328a75f547a73fc430e98291b475cba7db4c350c58948caab3391b141b16ee`. The interop peer executable SHA-256 values were Zig client `cd7109334de2b2564e1f3a01aa8a5802c8de2d1d805bcf7b70e0ecac1214e340` and C++ client `cc1da02d9455a27509068ccf5439b92bdfb3e6fe4851bb92a2804ceb79ade80a`; their source/build provenance is not inferred from these hashes.
+
+The candidate establishes a safer ownership/setup lifecycle with preserved RIO + IOCP behavior. It does **not** establish a measured performance gain. A profile-guided hot-path change remains future work if a repeatable server-side hotspot is found on the target deployment hardware.
