@@ -14,22 +14,10 @@ const batch_size: u32 = 256;
 
 pub const Progress = enum { close, post_receive, post_send };
 
-pub const WorkerResources = struct {
-    port: win32.Handle = .{},
-    thread: win32.ThreadHandle = .{},
-    ready_event: win32.EventHandle = .{},
-    arena: win32.VirtualMemory = .{},
-    registration: rio.Registration = .{},
-    completion_queue: rio.CompletionQueue = .{},
-    connections: ?[]internal.Connection = null,
-    free_indices: ?[]u32 = null,
-    timer_nodes: ?[]timer_heap.Node = null,
-    timer_positions: ?[]u32 = null,
-    connection_sockets: ?[]win32.Socket = null,
-};
+pub const WorkerResources = internal.WorkerResources;
 
 fn resources(worker: *internal.Worker) *WorkerResources {
-    return @ptrCast(@alignCast(worker.resources.?));
+    return worker.resources.?;
 }
 
 pub fn connectionCapacity(options: *const types.Options, worker_count: u32) ?u32 {
@@ -439,7 +427,7 @@ pub fn destroyWorker(worker: *internal.Worker) void {
     if (worker.thread != null) joinWorker(worker);
     owned.thread.deinit();
     worker.thread = null;
-    if (worker.ready and (!worker.admission_closed or worker.active_count != 0 or worker.notification_armed or worker.timers.?.len != 0))
+    if (!internal.workerStorageMayRelease(worker))
         win32.failFast("worker release precondition", c.ERROR_INVALID_STATE);
 
     if (worker.options != null and worker.options.?.stats) {

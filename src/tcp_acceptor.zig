@@ -11,16 +11,10 @@ const max_accepts: u32 = 1024;
 
 pub const ShutdownAction = enum { none, close_posted, wait_ack };
 
-pub const AcceptorResources = struct {
-    listener: win32.Socket = .{},
-    port: win32.Handle = .{},
-    thread: win32.ThreadHandle = .{},
-    ready_event: win32.EventHandle = .{},
-    operations: ?[]internal.AcceptOperation = null,
-};
+pub const AcceptorResources = internal.AcceptorResources;
 
 fn resources(acceptor: *internal.Acceptor) *AcceptorResources {
-    return @ptrCast(@alignCast(acceptor.resources.?));
+    return acceptor.resources.?;
 }
 
 pub fn operationCount(worker_count: u32) ?u32 {

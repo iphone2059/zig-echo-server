@@ -53,8 +53,22 @@ pub const Connection = struct {
     closing: bool = false,
 };
 
+pub const WorkerResources = struct {
+    port: win32.Handle = .{},
+    thread: win32.ThreadHandle = .{},
+    ready_event: win32.EventHandle = .{},
+    arena: win32.VirtualMemory = .{},
+    registration: rio.Registration = .{},
+    completion_queue: rio.CompletionQueue = .{},
+    connections: ?[]Connection = null,
+    free_indices: ?[]u32 = null,
+    timer_nodes: ?[]timer_heap.Node = null,
+    timer_positions: ?[]u32 = null,
+    connection_sockets: ?[]win32.Socket = null,
+};
+
 pub const Worker = struct {
-    resources: ?*anyopaque = null,
+    resources: ?*WorkerResources = null,
     rio_api: ?*const rio.Api = null,
     options: ?*const types.Options = null,
     failed: ?*std.atomic.Value(bool) = null,
@@ -95,8 +109,16 @@ pub const AcceptOperation = struct {
     addresses: [accept_address_bytes]u8 = @splat(0),
 };
 
+pub const AcceptorResources = struct {
+    listener: win32.Socket = .{},
+    port: win32.Handle = .{},
+    thread: win32.ThreadHandle = .{},
+    ready_event: win32.EventHandle = .{},
+    operations: ?[]AcceptOperation = null,
+};
+
 pub const Acceptor = struct {
-    resources: ?*anyopaque = null,
+    resources: ?*AcceptorResources = null,
     rio_api: ?*const rio.Api = null,
     options: ?*const types.Options = null,
     workers: ?[*]Worker = null,
@@ -126,6 +148,18 @@ pub const UdpSlot = struct {
 pub fn workerMayExit(lifecycle: *const WorkerLifecycle) bool {
     return @backingInt(lifecycle.phase) >= @backingInt(WorkerPhase.admission_closed) and
         lifecycle.active_connections == 0 and lifecycle.pending_handoffs == 0;
+}
+
+pub fn workerStorageMayRelease(worker: *const Worker) bool {
+    if (!worker.ready) return true;
+    if (!worker.admission_closed or worker.active_count != 0 or worker.notification_armed) return false;
+    const timers = worker.timers orelse return false;
+    if (timers.len != 0) return false;
+    const connections = worker.connections orelse return false;
+    for (connections[0..worker.slot_count]) |connection| {
+        if (connection.active or connection.closing or connection.outstanding != 0) return false;
+    }
+    return true;
 }
 
 pub fn udpMayRelease(phase: UdpPhase, outstanding: u32) bool {

@@ -9,6 +9,84 @@ const tcp_worker = server.tcp_worker;
 const tcp_acceptor = server.tcp_acceptor;
 const coordinator = server.engine;
 
+test "server worker and acceptor own typed resources" {
+    comptime {
+        if (@TypeOf((@as(internal.Worker, .{})).resources) != ?*internal.WorkerResources)
+            @compileError("worker resources must be a typed owner pointer");
+        if (@TypeOf((@as(internal.Acceptor, .{})).resources) != ?*internal.AcceptorResources)
+            @compileError("acceptor resources must be a typed owner pointer");
+        if (tcp_worker.WorkerResources != internal.WorkerResources)
+            @compileError("worker resource alias changed");
+        if (tcp_acceptor.AcceptorResources != internal.AcceptorResources)
+            @compileError("acceptor resource alias changed");
+    }
+}
+
+test "unpublished partially acquired server owners release only their resources" {
+    var worker_resources: internal.WorkerResources = .{};
+    worker_resources.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+    worker_resources.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
+    try std.testing.expect(worker_resources.port.get() != null);
+    try std.testing.expect(worker_resources.ready_event.get() != null);
+    var worker: internal.Worker = .{
+        .resources = &worker_resources,
+        .port = worker_resources.port.get(),
+        .ready_event = worker_resources.ready_event.get(),
+    };
+    tcp_worker.destroyWorker(&worker);
+    try std.testing.expect(worker.resources == null);
+    try std.testing.expect(worker_resources.port.get() == null);
+    try std.testing.expect(worker_resources.ready_event.get() == null);
+
+    var acceptor_resources: internal.AcceptorResources = .{};
+    acceptor_resources.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+    acceptor_resources.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
+    try std.testing.expect(acceptor_resources.port.get() != null);
+    try std.testing.expect(acceptor_resources.ready_event.get() != null);
+    var acceptor: internal.Acceptor = .{
+        .resources = &acceptor_resources,
+        .port = acceptor_resources.port.get(),
+        .ready_event = acceptor_resources.ready_event.get(),
+    };
+    tcp_acceptor.destroyAcceptor(&acceptor);
+    try std.testing.expect(acceptor.resources == null);
+    try std.testing.expect(acceptor_resources.port.get() == null);
+    try std.testing.expect(acceptor_resources.ready_event.get() == null);
+}
+
+test "published worker storage waits for notification and every request" {
+    var nodes: [1]timer_heap.Node = undefined;
+    var positions: [1]u32 = undefined;
+    var heap = try timer_heap.Heap.init(&nodes, &positions);
+    var connections: [1]internal.Connection = .{.{}};
+    var worker: internal.Worker = .{
+        .ready = true,
+        .admission_closed = true,
+        .connections = &connections,
+        .slot_count = 1,
+        .timers = heap,
+    };
+    try std.testing.expect(internal.workerStorageMayRelease(&worker));
+    worker.notification_armed = true;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+    worker.notification_armed = false;
+    connections[0].outstanding = 1;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+    connections[0].outstanding = 0;
+    connections[0].active = true;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+    connections[0].active = false;
+    worker.active_count = 1;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+    worker.active_count = 0;
+    worker.admission_closed = false;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+    worker.admission_closed = true;
+    try std.testing.expect(heap.insertOrUpdate(0, 10));
+    worker.timers = heap;
+    try std.testing.expect(!internal.workerStorageMayRelease(&worker));
+}
+
 test "Win32 owner transfer and reset are idempotent" {
     var socket: win32.Socket = .{};
     try std.testing.expectEqual(c.INVALID_SOCKET, socket.get());
