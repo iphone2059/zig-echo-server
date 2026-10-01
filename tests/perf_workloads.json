@@ -1,0 +1,8 @@
+[
+  {"name":"tcp_128_k1","protocol":"tcp","payload_bytes":128,"pipeline_depth":1,"sessions":256,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":6400000},
+  {"name":"tcp_4096_k8","protocol":"tcp","payload_bytes":4096,"pipeline_depth":8,"sessions":256,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":25600000},
+  {"name":"udp_1200","protocol":"udp","payload_bytes":1200,"pipeline_depth":1,"sessions":256,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":3200000},
+  {"name":"udp_65507","protocol":"udp","payload_bytes":65507,"pipeline_depth":1,"sessions":256,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":1600000},
+  {"name":"tcp_128_c1024","protocol":"tcp","payload_bytes":128,"pipeline_depth":1,"sessions":1024,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":3200000},
+  {"name":"tcp_128_c4096","protocol":"tcp","payload_bytes":128,"pipeline_depth":1,"sessions":4096,"threads":8,"cq":65536,"memory_bytes":2147483648,"socket_buffer_bytes":0,"rio_buffer_bytes":65507,"udp_depth":4096,"echo_count":3200000}
+]
