@@ -11,16 +11,14 @@ const max_accepts: u32 = 1024;
 
 pub const ShutdownAction = enum { none, close_posted, wait_ack };
 
-pub const AcceptorResources = struct {
-    listener: win32.Socket = .{},
-    port: win32.Handle = .{},
-    thread: win32.ThreadHandle = .{},
-    ready_event: win32.EventHandle = .{},
-    operations: ?[]internal.AcceptOperation = null,
+pub const AcceptorResources = internal.AcceptorResources;
+pub const AcceptorInitError = error{
+    WorkerCount, Listener, Port, ReadyEvent, ConfigureSocket, BindListen,
+    AssociateIocp, AcceptExExtension, AddressExtension, Operations,
 };
 
 fn resources(acceptor: *internal.Acceptor) *AcceptorResources {
-    return @ptrCast(@alignCast(acceptor.resources.?));
+    return acceptor.resources.?;
 }
 
 pub fn operationCount(worker_count: u32) ?u32 {
@@ -222,11 +220,26 @@ fn acceptorThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
     return if (acceptor.failed.?.load(.acquire)) 1 else 0;
 }
 
-pub fn initializeAcceptor(acceptor: *internal.Acceptor, api: *const rio.Api, options: *const types.Options, workers: []internal.Worker, failed: *std.atomic.Value(bool), resource_storage: *AcceptorResources) bool {
+pub fn initializeAcceptor(acceptor: *internal.Acceptor, api: *const rio.Api, options: *const types.Options, workers: []internal.Worker, failed: *std.atomic.Value(bool), resource_storage: *AcceptorResources) AcceptorInitError!void {
+    return initializeAcceptorImpl(acceptor, api, options, workers, failed, resource_storage, null);
+}
+
+pub fn initializeAcceptorFaultForTest(acceptor: *internal.Acceptor, api: *const rio.Api, options: *const types.Options, workers: []internal.Worker, failed: *std.atomic.Value(bool), resource_storage: *AcceptorResources, comptime stage: AcceptorInitError) AcceptorInitError!void {
+    if (!@import("builtin").is_test) @compileError("acceptor setup fault injection is test-only");
+    return initializeAcceptorImpl(acceptor, api, options, workers, failed, resource_storage, stage);
+}
+
+fn faultAt(comptime selected: ?AcceptorInitError, comptime stage: AcceptorInitError) bool {
+    return selected != null and selected.? == stage;
+}
+
+fn initializeAcceptorImpl(acceptor: *internal.Acceptor, api: *const rio.Api, options: *const types.Options, workers: []internal.Worker, failed: *std.atomic.Value(bool), resource_storage: *AcceptorResources, comptime fault_stage: ?AcceptorInitError) AcceptorInitError!void {
     acceptor.* = .{};
     resource_storage.* = .{};
-    if (workers.len == 0 or workers.len > std.math.maxInt(u32)) return false;
+    if (faultAt(fault_stage, error.WorkerCount)) return error.WorkerCount;
+    if (workers.len == 0 or workers.len > std.math.maxInt(u32)) return error.WorkerCount;
     acceptor.resources = resource_storage;
+    errdefer destroyAcceptor(acceptor);
     acceptor.rio_api = api;
     acceptor.options = options;
     acceptor.workers = workers.ptr;
@@ -236,33 +249,49 @@ pub fn initializeAcceptor(acceptor: *internal.Acceptor, api: *const rio.Api, opt
 
     resource_storage.listener.reset(win32.registeredSocket(c.SOCK_STREAM, c.IPPROTO_TCP));
     acceptor.listener = resource_storage.listener.get();
+    if (acceptor.listener == c.INVALID_SOCKET) {
+        win32.report("TCP listener creation", @intCast(c.WSAGetLastError()));
+        return error.Listener;
+    }
+    if (faultAt(fault_stage, error.Listener)) return error.Listener;
     resource_storage.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
     acceptor.port = resource_storage.port.get();
+    if (acceptor.port == null) {
+        win32.report("TCP acceptor IOCP creation", c.GetLastError());
+        return error.Port;
+    }
+    if (faultAt(fault_stage, error.Port)) return error.Port;
     resource_storage.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
     acceptor.ready_event = resource_storage.ready_event.get();
-    if (acceptor.listener == c.INVALID_SOCKET or acceptor.port == null or acceptor.ready_event == null) {
-        win32.report("TCP listener/IOCP/event creation", @intCast(c.WSAGetLastError()));
-        return false;
+    if (acceptor.ready_event == null) {
+        win32.report("TCP acceptor event creation", c.GetLastError());
+        return error.ReadyEvent;
     }
-    if (!win32.configureSocket(acceptor.listener, options.socket_buffer_bytes, true)) return false;
+    if (faultAt(fault_stage, error.ReadyEvent)) return error.ReadyEvent;
+    if (!win32.configureSocket(acceptor.listener, options.socket_buffer_bytes, true)) return error.ConfigureSocket;
+    if (faultAt(fault_stage, error.ConfigureSocket)) return error.ConfigureSocket;
     var address: c.SOCKADDR_IN = std.mem.zeroes(c.SOCKADDR_IN);
     address.sin_family = c.AF_INET;
     address.sin_addr.S_un.S_addr = c.htonl(c.INADDR_ANY);
     address.sin_port = c.htons(options.port);
     if (c.bind(acceptor.listener, @ptrCast(&address), @sizeOf(c.SOCKADDR_IN)) != 0 or c.listen(acceptor.listener, c.SOMAXCONN) != 0) {
         win32.report("bind/listen(TCP)", @intCast(c.WSAGetLastError()));
-        return false;
+        return error.BindListen;
     }
+    if (faultAt(fault_stage, error.BindListen)) return error.BindListen;
     if (c.CreateIoCompletionPort(@ptrFromInt(acceptor.listener), acceptor.port, 0, 1) != acceptor.port) {
         win32.report("associate listener IOCP", c.GetLastError());
-        return false;
+        return error.AssociateIocp;
     }
-    acceptor.accept_ex = loadExtension(c.LPFN_ACCEPTEX, acceptor.listener, c.WSAID_ACCEPTEX, "load AcceptEx") orelse return false;
-    acceptor.get_accept_addresses = loadExtension(c.LPFN_GETACCEPTEXSOCKADDRS, acceptor.listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs") orelse return false;
+    if (faultAt(fault_stage, error.AssociateIocp)) return error.AssociateIocp;
+    acceptor.accept_ex = loadExtension(c.LPFN_ACCEPTEX, acceptor.listener, c.WSAID_ACCEPTEX, "load AcceptEx") orelse return error.AcceptExExtension;
+    if (faultAt(fault_stage, error.AcceptExExtension)) return error.AcceptExExtension;
+    acceptor.get_accept_addresses = loadExtension(c.LPFN_GETACCEPTEXSOCKADDRS, acceptor.listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs") orelse return error.AddressExtension;
+    if (faultAt(fault_stage, error.AddressExtension)) return error.AddressExtension;
 
     resource_storage.operations = std.heap.page_allocator.alloc(internal.AcceptOperation, acceptor.operation_count) catch {
         win32.report("allocate accept operations", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.Operations;
     };
     acceptor.operations = resource_storage.operations.?.ptr;
     for (resource_storage.operations.?, 0..) |*operation, index| {
@@ -272,7 +301,7 @@ pub fn initializeAcceptor(acceptor: *internal.Acceptor, api: *const rio.Api, opt
             .index = @intCast(index),
         };
     }
-    return true;
+    if (faultAt(fault_stage, error.Operations)) return error.Operations;
 }
 
 pub fn startAcceptor(acceptor: *internal.Acceptor) bool {

@@ -28,10 +28,7 @@ pub fn main(init: std.process.Init) u8 {
     var failed = std.atomic.Value(bool).init(false);
     var worker: server.engine_internal.Worker = .{};
     var worker_resources: server.tcp_worker.WorkerResources = .{};
-    if (!server.tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &worker_resources)) {
-        server.tcp_worker.destroyWorker(&worker);
-        return 2;
-    }
+    server.tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &worker_resources) catch return 2;
     if (!server.tcp_worker.startWorker(&worker)) {
         server.tcp_worker.postAdmissionClosed(&worker);
         server.tcp_worker.postStop(&worker);
@@ -41,14 +38,15 @@ pub fn main(init: std.process.Init) u8 {
 
     var acceptor: server.engine_internal.Acceptor = .{};
     var acceptor_resources: server.tcp_acceptor.AcceptorResources = .{};
-    const acceptor_initialized = server.tcp_acceptor.initializeAcceptor(&acceptor, &api, &options, @as([*]server.engine_internal.Worker, @ptrCast(&worker))[0..1], &failed, &acceptor_resources);
-    if (!acceptor_initialized or !server.tcp_acceptor.startAcceptor(&acceptor)) {
-        if (acceptor_initialized) {
-            if (acceptor.thread != null) server.tcp_acceptor.stopAcceptor(&acceptor) else server.tcp_worker.postAdmissionClosed(&worker);
-            server.tcp_acceptor.destroyAcceptor(&acceptor);
-        } else {
-            server.tcp_worker.postAdmissionClosed(&worker);
-        }
+    server.tcp_acceptor.initializeAcceptor(&acceptor, &api, &options, @as([*]server.engine_internal.Worker, @ptrCast(&worker))[0..1], &failed, &acceptor_resources) catch {
+        server.tcp_worker.postAdmissionClosed(&worker);
+        server.tcp_worker.postStop(&worker);
+        server.tcp_worker.destroyWorker(&worker);
+        return 2;
+    };
+    if (!server.tcp_acceptor.startAcceptor(&acceptor)) {
+        if (acceptor.thread != null) server.tcp_acceptor.stopAcceptor(&acceptor) else server.tcp_worker.postAdmissionClosed(&worker);
+        server.tcp_acceptor.destroyAcceptor(&acceptor);
         server.tcp_worker.postStop(&worker);
         server.tcp_worker.destroyWorker(&worker);
         return 2;
