@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory=$true)][string]$CppClientPath
 )
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'interop_child_lifecycle.ps1')
 $serverExe=(Resolve-Path -LiteralPath $ServerPath).Path
 $peers=@(
     [pscustomobject]@{ name='zig'; path=(Resolve-Path -LiteralPath $ZigClientPath).Path },
@@ -51,7 +52,7 @@ foreach ($peer in $peers) {
             $client=Start-Process -FilePath $peer.path -ArgumentList $clientArgs -WindowStyle Hidden -PassThru `
                 -RedirectStandardOutput $clientStdout -RedirectStandardError $clientStderr
             try {
-                if (-not $client.WaitForExit(60000)) { throw "client timed out: $($peer.name)/$($case.name)" }
+                Wait-InteropChild -Process $client -TimeoutMilliseconds 60000 -Description "$($peer.name)/$($case.name)"
                 if ($client.ExitCode -ne 0) { throw "client exit $($client.ExitCode): $($peer.name)/$($case.name)" }
             } finally { $client.Dispose() }
             $stdout=Get-Content -LiteralPath $clientStdout -Raw
