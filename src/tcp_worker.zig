@@ -15,6 +15,10 @@ const batch_size: u32 = 256;
 pub const Progress = enum { close, post_receive, post_send };
 
 pub const WorkerResources = internal.WorkerResources;
+pub const WorkerInitError = error{
+    Port, ReadyEvent, Capacity, Arena, Connections, FreeIndices, TimerNodes, TimerPositions,
+    SocketOwners, TimerHeap, Registration, CompletionQueue,
+};
 
 fn resources(worker: *internal.Worker) *WorkerResources {
     return worker.resources.?;
@@ -291,10 +295,24 @@ fn workerThread(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
     return if (worker.failed.?.load(.acquire)) 1 else 0;
 }
 
-pub fn initializeWorker(worker: *internal.Worker, api: *const rio.Api, options: *const types.Options, failed: *std.atomic.Value(bool), worker_index: u32, worker_count: u32, resource_storage: *WorkerResources) bool {
+pub fn initializeWorker(worker: *internal.Worker, api: *const rio.Api, options: *const types.Options, failed: *std.atomic.Value(bool), worker_index: u32, worker_count: u32, resource_storage: *WorkerResources) WorkerInitError!void {
+    return initializeWorkerImpl(worker, api, options, failed, worker_index, worker_count, resource_storage, null);
+}
+
+pub fn initializeWorkerFaultForTest(worker: *internal.Worker, api: *const rio.Api, options: *const types.Options, failed: *std.atomic.Value(bool), worker_index: u32, worker_count: u32, resource_storage: *WorkerResources, comptime stage: WorkerInitError) WorkerInitError!void {
+    if (!@import("builtin").is_test) @compileError("worker setup fault injection is test-only");
+    return initializeWorkerImpl(worker, api, options, failed, worker_index, worker_count, resource_storage, stage);
+}
+
+fn faultAt(comptime selected: ?WorkerInitError, comptime stage: WorkerInitError) bool {
+    return selected != null and selected.? == stage;
+}
+
+fn initializeWorkerImpl(worker: *internal.Worker, api: *const rio.Api, options: *const types.Options, failed: *std.atomic.Value(bool), worker_index: u32, worker_count: u32, resource_storage: *WorkerResources, comptime fault_stage: ?WorkerInitError) WorkerInitError!void {
     worker.* = .{};
     resource_storage.* = .{};
     worker.resources = resource_storage;
+    errdefer destroyWorker(worker);
     worker.rio_api = api;
     worker.options = options;
     worker.failed = failed;
@@ -303,65 +321,79 @@ pub fn initializeWorker(worker: *internal.Worker, api: *const rio.Api, options: 
 
     resource_storage.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
     worker.port = resource_storage.port.get();
+    if (worker.port == null) {
+        win32.report("CreateIoCompletionPort(worker)", c.GetLastError());
+        return error.Port;
+    }
+    if (faultAt(fault_stage, error.Port)) return error.Port;
     resource_storage.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
     worker.ready_event = resource_storage.ready_event.get();
-    if (worker.port == null or worker.ready_event == null) {
-        win32.report("CreateIoCompletionPort/CreateEvent(worker)", c.GetLastError());
-        return false;
+    if (worker.ready_event == null) {
+        win32.report("CreateEvent(worker)", c.GetLastError());
+        return error.ReadyEvent;
     }
+    if (faultAt(fault_stage, error.ReadyEvent)) return error.ReadyEvent;
 
     worker.slot_count = connectionCapacity(options, worker_count) orelse {
         win32.report("worker registered arena capacity", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.Capacity;
     };
+    if (faultAt(fault_stage, error.Capacity)) return error.Capacity;
     const memory_share = options.memory_bytes / worker_count;
     const arena_bytes = contract.checkedArenaBytes(worker.slot_count, worker.stride, memory_share) orelse {
         win32.report("worker registered arena size", c.ERROR_ARITHMETIC_OVERFLOW);
-        return false;
+        return error.Arena;
     };
     if (arena_bytes > std.math.maxInt(u32)) {
         win32.report("worker registered arena > DWORD", c.ERROR_ARITHMETIC_OVERFLOW);
-        return false;
+        return error.Arena;
     }
 
     resource_storage.arena = win32.VirtualMemory.alloc(arena_bytes) catch {
         win32.report("VirtualAlloc(worker)", c.GetLastError());
-        return false;
+        return error.Arena;
     };
+    if (faultAt(fault_stage, error.Arena)) return error.Arena;
     worker.memory = resource_storage.arena.bytes();
     const allocator = std.heap.page_allocator;
     resource_storage.connections = allocator.alloc(internal.Connection, worker.slot_count) catch {
         win32.report("allocate worker connections", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.Connections;
     };
+    if (faultAt(fault_stage, error.Connections)) return error.Connections;
     resource_storage.free_indices = allocator.alloc(u32, worker.slot_count) catch {
         win32.report("allocate worker free indices", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.FreeIndices;
     };
+    if (faultAt(fault_stage, error.FreeIndices)) return error.FreeIndices;
     resource_storage.timer_nodes = allocator.alloc(timer_heap.Node, worker.slot_count) catch {
         win32.report("allocate worker timer nodes", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.TimerNodes;
     };
+    if (faultAt(fault_stage, error.TimerNodes)) return error.TimerNodes;
     resource_storage.timer_positions = allocator.alloc(u32, worker.slot_count) catch {
         win32.report("allocate worker timer positions", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.TimerPositions;
     };
+    if (faultAt(fault_stage, error.TimerPositions)) return error.TimerPositions;
     resource_storage.connection_sockets = allocator.alloc(win32.Socket, worker.slot_count) catch {
         win32.report("allocate worker socket owners", c.ERROR_NOT_ENOUGH_MEMORY);
-        return false;
+        return error.SocketOwners;
     };
+    for (resource_storage.connection_sockets.?) |*socket| socket.* = .{};
+    if (faultAt(fault_stage, error.SocketOwners)) return error.SocketOwners;
     worker.connections = resource_storage.connections.?.ptr;
     worker.free_indices = resource_storage.free_indices.?.ptr;
     worker.timer_nodes = resource_storage.timer_nodes.?.ptr;
     worker.timer_positions = resource_storage.timer_positions.?.ptr;
     worker.timers = timer_heap.Heap.init(resource_storage.timer_nodes.?, resource_storage.timer_positions.?) catch {
         win32.report("initialize worker timers", c.ERROR_INVALID_DATA);
-        return false;
+        return error.TimerHeap;
     };
+    if (faultAt(fault_stage, error.TimerHeap)) return error.TimerHeap;
     for (resource_storage.connections.?, 0..) |*connection, index| {
         connection.* = .{ .index = @intCast(index) };
         resource_storage.free_indices.?[index] = worker.slot_count - @as(u32, @intCast(index)) - 1;
-        resource_storage.connection_sockets.?[index] = .{};
     }
     worker.free_count = worker.slot_count;
 
@@ -369,8 +401,9 @@ pub fn initializeWorker(worker: *internal.Worker, api: *const rio.Api, options: 
     worker.registration = resource_storage.registration.id;
     if (worker.registration == c.RIO_INVALID_BUFFERID) {
         win32.report("RIORegisterBuffer(worker)", @intCast(c.WSAGetLastError()));
-        return false;
+        return error.Registration;
     }
+    if (faultAt(fault_stage, error.Registration)) return error.Registration;
     var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
     notification.Type = c.RIO_IOCP_COMPLETION;
     notification.Iocp.IocpHandle = worker.port;
@@ -380,9 +413,9 @@ pub fn initializeWorker(worker: *internal.Worker, api: *const rio.Api, options: 
     worker.completion_queue = resource_storage.completion_queue.value;
     if (worker.completion_queue == c.RIO_INVALID_CQ) {
         win32.report("RIOCreateCompletionQueue(worker)", @intCast(c.WSAGetLastError()));
-        return false;
+        return error.CompletionQueue;
     }
-    return true;
+    if (faultAt(fault_stage, error.CompletionQueue)) return error.CompletionQueue;
 }
 
 pub fn startWorker(worker: *internal.Worker) bool {
@@ -430,7 +463,7 @@ pub fn destroyWorker(worker: *internal.Worker) void {
     if (!internal.workerStorageMayRelease(worker))
         win32.failFast("worker release precondition", c.ERROR_INVALID_STATE);
 
-    if (worker.options != null and worker.options.?.stats) {
+    if (worker.ready and worker.options != null and worker.options.?.stats) {
         var buffer: [512]u8 = undefined;
         const output = std.fmt.bufPrint(&buffer, "[worker {d}] accepted={d} completions={d} receives={d} sends={d} bytes={d} active={d}\n", .{
             worker.worker_index,     worker.statistics.accepted, worker.statistics.completions, worker.statistics.receives,

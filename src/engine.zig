@@ -60,27 +60,27 @@ fn runTcp(api: *const rio.Api, options: *const types.Options, stop: *std.atomic.
     var initialized: u32 = 0;
     var started: u32 = 0;
     for (workers, worker_resources, 0..) |*worker, *owned, index| {
-        if (!tcp_worker.initializeWorker(worker, api, options, &failed, @intCast(index), worker_count, owned)) {
+        tcp_worker.initializeWorker(worker, api, options, &failed, @intCast(index), worker_count, owned) catch {
             failed.store(true, .release);
-            tcp_worker.destroyWorker(worker);
             break;
-        }
+        };
         initialized += 1;
-        if (!tcp_worker.startWorker(worker)) {
+        const ready = tcp_worker.startWorker(worker);
+        if (worker.thread != null) started += 1;
+        if (!ready) {
             failed.store(true, .release);
             break;
         }
-        started += 1;
     }
 
     var acceptor: internal.Acceptor = .{};
     var acceptor_resources: tcp_acceptor.AcceptorResources = .{};
-    var acceptor_initialized = false;
-    var acceptor_started = false;
     if (!failed.load(.acquire)) {
-        acceptor_initialized = tcp_acceptor.initializeAcceptor(&acceptor, api, options, workers, &failed, &acceptor_resources);
-        if (acceptor_initialized) acceptor_started = tcp_acceptor.startAcceptor(&acceptor);
-        if (!acceptor_started) failed.store(true, .release);
+        if (tcp_acceptor.initializeAcceptor(&acceptor, api, options, workers, &failed, &acceptor_resources)) |_| {
+            if (!tcp_acceptor.startAcceptor(&acceptor)) failed.store(true, .release);
+        } else |_| {
+            failed.store(true, .release);
+        }
     }
 
     const start = c.GetTickCount64();
@@ -93,13 +93,14 @@ fn runTcp(api: *const rio.Api, options: *const types.Options, stop: *std.atomic.
     }
 
     var shutdown: ShutdownSequence = .{};
-    if (acceptor_started) tcp_acceptor.stopAcceptor(&acceptor);
+    const acceptor_published = acceptor.thread != null;
+    if (acceptor_published) tcp_acceptor.stopAcceptor(&acceptor);
     if (acceptor.resources != null) {
         tcp_acceptor.destroyAcceptor(&acceptor);
     }
     if (!shutdown.advance(.acceptor_stopped)) win32.failFast("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
-    if (!acceptor_started) {
+    if (!acceptor_published) {
         for (workers[0..started]) |*worker| tcp_worker.postAdmissionClosed(worker);
     }
     if (!shutdown.advance(.admission_closed)) win32.failFast("TCP shutdown admission order", c.ERROR_INVALID_STATE);

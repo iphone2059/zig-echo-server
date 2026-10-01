@@ -22,6 +22,83 @@ test "server worker and acceptor own typed resources" {
     }
 }
 
+test "synchronous server initializers expose stage-specific errors" {
+    comptime {
+        const worker_result = @typeInfo(@TypeOf(tcp_worker.initializeWorker)).@"fn".return_type.?;
+        const acceptor_result = @typeInfo(@TypeOf(tcp_acceptor.initializeAcceptor)).@"fn".return_type.?;
+        if (worker_result != tcp_worker.WorkerInitError!void)
+            @compileError("worker setup must return a typed error union");
+        if (acceptor_result != tcp_acceptor.AcceptorInitError!void)
+            @compileError("acceptor setup must return a typed error union");
+    }
+}
+
+test "worker setup rolls back every unpublished acquisition stage" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const api = try rio.Api.load();
+    var options: server.types.Options = .{
+        .protocol = .tcp,
+        .worker_count = 1,
+        .rio_buffer_bytes = 4096,
+        .cq_capacity = 64,
+        .memory_bytes = 1024 * 1024,
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    inline for (.{ error.Port, error.ReadyEvent, error.Capacity, error.Arena, error.Connections,
+        error.FreeIndices, error.TimerNodes, error.TimerPositions, error.SocketOwners,
+        error.TimerHeap, error.Registration, error.CompletionQueue }) |stage| {
+        var worker: internal.Worker = .{};
+        var owned: internal.WorkerResources = .{};
+        try std.testing.expectError(stage,
+            tcp_worker.initializeWorkerFaultForTest(&worker, &api, &options, &failed, 0, 1, &owned, stage));
+        try std.testing.expect(worker.resources == null);
+        try std.testing.expect(worker.port == null);
+        try std.testing.expect(worker.thread == null);
+        try std.testing.expect(worker.ready_event == null);
+        try std.testing.expect(owned.port.get() == null);
+        try std.testing.expect(owned.ready_event.get() == null);
+        try std.testing.expect(owned.arena.get() == null);
+        try std.testing.expect(owned.connections == null);
+        try std.testing.expect(owned.connection_sockets == null);
+        try std.testing.expectEqual(c.RIO_INVALID_BUFFERID, owned.registration.id);
+        try std.testing.expectEqual(c.RIO_INVALID_CQ, owned.completion_queue.value);
+    }
+}
+
+test "acceptor setup rolls back every unpublished acquisition stage" {
+    var winsock = try win32.Winsock.init();
+    defer winsock.deinit();
+    const api = try rio.Api.load();
+    var options: server.types.Options = .{
+        .protocol = .tcp,
+        .port = 0,
+        .worker_count = 1,
+        .rio_buffer_bytes = 4096,
+        .cq_capacity = 64,
+        .memory_bytes = 1024 * 1024,
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    var workers: [1]internal.Worker = .{.{}};
+    inline for (.{ error.WorkerCount, error.Listener, error.Port, error.ReadyEvent,
+        error.ConfigureSocket, error.BindListen, error.AssociateIocp, error.AcceptExExtension,
+        error.AddressExtension, error.Operations }) |stage| {
+        var acceptor: internal.Acceptor = .{};
+        var owned: internal.AcceptorResources = .{};
+        const selected = if (stage == error.WorkerCount) workers[0..0] else workers[0..];
+        try std.testing.expectError(stage,
+            tcp_acceptor.initializeAcceptorFaultForTest(&acceptor, &api, &options, selected, &failed, &owned, stage));
+        try std.testing.expect(acceptor.resources == null);
+        try std.testing.expect(acceptor.thread == null);
+        try std.testing.expect(acceptor.port == null);
+        try std.testing.expect(acceptor.ready_event == null);
+        try std.testing.expectEqual(c.INVALID_SOCKET, owned.listener.get());
+        try std.testing.expect(owned.port.get() == null);
+        try std.testing.expect(owned.ready_event.get() == null);
+        try std.testing.expect(owned.operations == null);
+    }
+}
+
 test "unpublished partially acquired server owners release only their resources" {
     var worker_resources: internal.WorkerResources = .{};
     worker_resources.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
@@ -407,7 +484,7 @@ test "TCP worker arms RIO notification before ready and drains control shutdown"
     var failed = std.atomic.Value(bool).init(false);
     var worker: internal.Worker = .{};
     var resources: tcp_worker.WorkerResources = .{};
-    try std.testing.expect(tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &resources));
+    try tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &resources);
     defer tcp_worker.destroyWorker(&worker);
     try std.testing.expect(tcp_worker.startWorker(&worker));
     try std.testing.expect(worker.ready);
