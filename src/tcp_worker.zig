@@ -1,5 +1,5 @@
 const std = @import("std");
-const contract = @import("contract.zig");
+const contract = @import("ces_contract.zig");
 const fault_guards = @import("fault_guards.zig");
 const internal = @import("engine_internal.zig");
 const rio = @import("rio.zig");
@@ -501,3 +501,4 @@ pub fn destroyWorker(worker: *internal.Worker) void {
     worker.ready_event = null;
     worker.port = null;
 }
+
