@@ -6,6 +6,36 @@
 
 pub const version = "echo-binary-contract-v1";
 
+/// The value switches this server accepts, as compile-time data: the parser asks the table instead
+/// of spelling every switch name out at each use, so the accepted set lives in exactly one place.
+pub const Switch = struct {
+    name: []const u8,
+    minimum: u64,
+    maximum: u64,
+};
+
+pub const switch_table = [_]Switch{
+    .{ .name = "p", .minimum = 0, .maximum = 0 },
+    .{ .name = "s", .minimum = 1, .maximum = 65535 },
+    .{ .name = "t", .minimum = 1, .maximum = std.math.maxInt(u32) },
+    .{ .name = "w", .minimum = 1, .maximum = std.math.maxInt(u32) },
+    .{ .name = "b", .minimum = 0, .maximum = std.math.maxInt(i32) },
+    .{ .name = "k", .minimum = 1, .maximum = 65536 },
+    .{ .name = "threads", .minimum = 1, .maximum = 64 },
+    .{ .name = "rio-buffer", .minimum = 512, .maximum = 1048576 },
+    .{ .name = "cq", .minimum = 64, .maximum = 1048576 },
+    .{ .name = "memory", .minimum = 1048576, .maximum = std.math.maxInt(u64) },
+};
+
+/// Compile-time lookup: the compiler unrolls the table, so a typo here is a build error.
+pub fn switchInfo(name: []const u8) ?Switch {
+    inline for (switch_table) |entry| {
+        if (std.ascii.eqlIgnoreCase(name, entry.name)) return entry;
+    }
+    return null;
+}
+
+
 /// Diagnostic tokens.
 pub const tokens = struct {
     pub const protocol_option = "protocol-option";
@@ -95,10 +125,7 @@ fn isSwitch(token: []const u8) bool {
 }
 
 fn isKnownValueSwitch(name: []const u8) bool {
-    return equalAsciiFold(name, "p") or equalAsciiFold(name, "s") or equalAsciiFold(name, "t") or
-        equalAsciiFold(name, "w") or equalAsciiFold(name, "b") or equalAsciiFold(name, "k") or
-        equalAsciiFold(name, "threads") or equalAsciiFold(name, "rio-buffer") or
-        equalAsciiFold(name, "cq") or equalAsciiFold(name, "memory");
+    return switchInfo(name) != null;
 }
 
 fn setError(buffer: []u8, message: []const u8) void {
