@@ -8,13 +8,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$requiredVersion = '0.17.0-dev.2375+d8aab4878'
+$requiredVersion = '0.17'
 $pinnedZig = 'C:\bin\zig-x86_64-windows-0.17.0-dev.2375+d8aab4878\zig.exe'
+$extensionZig = Join-Path $env:APPDATA 'Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.17.0\zig.exe'
 if (-not $ZigPath) {
     if ($env:ZIG_EXE) {
         $ZigPath = $env:ZIG_EXE
     } elseif (Test-Path -LiteralPath $pinnedZig -PathType Leaf) {
         $ZigPath = $pinnedZig
+    } elseif (Test-Path -LiteralPath $extensionZig -PathType Leaf) {
+        $ZigPath = $extensionZig
     } else {
         $fromPath = Get-Command zig -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         $ZigPath = if ($fromPath) { $fromPath.Source } else { $pinnedZig }
@@ -23,7 +26,7 @@ if (-not $ZigPath) {
 
 $resolvedZig = (Resolve-Path -LiteralPath $ZigPath -ErrorAction Stop).Path
 $actualVersion = (& $resolvedZig version | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $requiredVersion) {
+if ($LASTEXITCODE -ne 0 -or $actualVersion -notlike ($requiredVersion + '*')) {
     [Console]::Error.WriteLine("zig-echo-server requires Zig $requiredVersion; got '$actualVersion' from '$resolvedZig'.")
     exit 1
 }
