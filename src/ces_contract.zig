@@ -204,6 +204,8 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         }
 
         const number = parseNumber(value) orelse return fail(error_buffer, tokens.invalid_number);
+        const info = switchInfo(name) orelse return fail(error_buffer, tokens.unknown_switch);
+        if (number < info.minimum or number > info.maximum) return fail(error_buffer, tokens.out_of_range);
         if (equalAsciiFold(name, "s") and number >= 1 and number <= 65535) {
             out.port = @intCast(number);
         } else if (equalAsciiFold(name, "t") and number >= 1 and number <= std.math.maxInt(u32)) {
