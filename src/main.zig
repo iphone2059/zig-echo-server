@@ -2,7 +2,7 @@ const std = @import("std");
 const sdk = @import("sdk.zig");
 const c = sdk.c;
 const types = @import("types.zig");
-const options_mod = @import("options.zig");
+const options_mod = @import("ces_contract.zig");
 const win32 = @import("win32.zig");
 const engine = @import("engine.zig");
 
@@ -17,12 +17,12 @@ fn consoleHandler(kind: c.DWORD) callconv(.winapi) c.BOOL {
 }
 
 fn help() void {
-    const text =
-        "Usage: zig-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]\n" ++
-        "       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]\n" ++
-        "       [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
-        "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
-    if (!win32.writeStdout(text)) win32.failFast("write help", c.GetLastError());
+    if (!win32.writeStdout(options_mod.usage)) win32.failFast("write help", c.GetLastError());
+}
+
+/// A malformed command line reports the diagnostic and the usage on stderr, leaving stdout empty.
+fn helpError() void {
+    if (!win32.writeStderr(options_mod.usage)) win32.failFast("write usage error", c.GetLastError());
 }
 
 pub fn main(init: std.process.Init) u8 {
@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) u8 {
         const message = std.fmt.bufPrint(&message_buffer, "Invalid arguments: {s}\n", .{std.mem.sliceTo(&error_buffer, 0)}) catch
             win32.failFast("format argument error", c.ERROR_INSUFFICIENT_BUFFER);
         if (!win32.writeStderr(message)) win32.failFast("write argument error", c.GetLastError());
-        help();
+        helpError();
         return @backingInt(types.ExitCode.usage);
     }
     if (options.help) {

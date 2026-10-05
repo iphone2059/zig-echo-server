@@ -1,4 +1,79 @@
+//! The server binary's contract, in one place: the command line (switches, ranges, diagnostic
+//! tokens, usage text) and the contract helpers the engine needs, mirroring the reference's single
+//! contract file.
+//!
+//! Reference implementation: echo-binary-contract-v1 (the C++ server).
+
+pub const version = "echo-binary-contract-v1";
+
+/// Diagnostic tokens.
+pub const tokens = struct {
+    pub const protocol_option = "protocol-option";
+    pub const invalid_number = "invalid-number";
+    pub const out_of_range = "out-of-range";
+    pub const unknown_switch = "unknown-switch";
+};
+
+/// Usage text.
+pub const usage =
+    "Usage: zig-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]\n" ++
+    "       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]\n" ++
+    "       [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
+    "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
+
 const std = @import("std");
+
+pub fn checkedProduct(left: usize, right: usize) ?usize {
+    const pair = @mulWithOverflow(left, right);
+    if (pair[1] != 0) return null;
+    return pair[0];
+}
+
+pub fn checkedArenaBytes(slots: usize, stride: usize, memory_limit: u64) ?usize {
+    const bytes = checkedProduct(slots, stride) orelse return null;
+    if (bytes > memory_limit) return null;
+    return bytes;
+}
+
+pub fn tcpConnectionCapacity(cq_capacity: u32, memory_slots: u64) u32 {
+    const cq_slots: u64 = cq_capacity / 2;
+    const limit = @min(cq_slots, memory_slots);
+    return @intCast(@min(limit, std.math.maxInt(u32)));
+}
+
+pub fn advanceOffset(total: usize, transferred: usize, offset: *usize) bool {
+    if (transferred == 0 or offset.* > total or transferred > total - offset.*) return false;
+    offset.* += transferred;
+    return true;
+}
+
+pub fn notificationMarkDelivered(armed: *bool) bool {
+    if (!armed.*) return false;
+    armed.* = false;
+    return true;
+}
+
+pub fn notificationMarkRearmed(armed: *bool) bool {
+    if (armed.*) return false;
+    armed.* = true;
+    return true;
+}
+
+test "checked arithmetic" {
+    try std.testing.expectEqual(@as(?usize, 42), checkedProduct(6, 7));
+    try std.testing.expect(checkedProduct(std.math.maxInt(usize), 2) == null);
+    try std.testing.expectEqual(@as(?usize, 4096), checkedArenaBytes(4, 1024, 4096));
+    try std.testing.expect(checkedArenaBytes(4, 1024, 4095) == null);
+}
+
+test "notification transitions" {
+    var armed = false;
+    try std.testing.expect(notificationMarkRearmed(&armed));
+    try std.testing.expect(!notificationMarkRearmed(&armed));
+    try std.testing.expect(notificationMarkDelivered(&armed));
+    try std.testing.expect(!notificationMarkDelivered(&armed));
+}
+
 const types = @import("types.zig");
 
 fn equalAsciiFold(left: []const u8, right: []const u8) bool {
@@ -79,7 +154,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             continue;
         }
 
-        if (!isKnownValueSwitch(name)) return fail(error_buffer, "unknown switch");
+        if (!isKnownValueSwitch(name)) return fail(error_buffer, tokens.unknown_switch);
         const value: []const u8 = if (separator != null)
             inline_value
         else value_block: {
@@ -101,7 +176,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
             continue;
         }
 
-        const number = parseNumber(value) orelse return fail(error_buffer, "numeric switch has an invalid value");
+        const number = parseNumber(value) orelse return fail(error_buffer, tokens.invalid_number);
         if (equalAsciiFold(name, "s") and number >= 1 and number <= 65535) {
             out.port = @intCast(number);
         } else if (equalAsciiFold(name, "t") and number >= 1 and number <= std.math.maxInt(u32)) {
@@ -124,14 +199,14 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         } else if (equalAsciiFold(name, "memory") and number >= 1048576) {
             out.memory_bytes = number;
         } else {
-            return fail(error_buffer, "unknown switch or value outside its valid range");
+            return fail(error_buffer, tokens.out_of_range);
         }
     }
 
+    if (out.protocol == .tcp and saw_udp_depth) return fail(error_buffer, tokens.protocol_option);
+    if (out.protocol == .udp and saw_timeout) return fail(error_buffer, tokens.protocol_option);
     if (out.help) return true;
     if (out.protocol == .none) return fail(error_buffer, "missing /p tcp or /p udp");
-    if (out.protocol == .tcp and saw_udp_depth) return fail(error_buffer, "/k is available only for UDP");
-    if (out.protocol == .udp and saw_timeout) return fail(error_buffer, "/t is available only for TCP");
     if (out.protocol == .udp) {
         if (!saw_rio_buffer) {
             out.rio_buffer_bytes = types.max_udp_payload;

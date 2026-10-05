@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const c = win32.c;
 const rio_mod = @import("rio.zig");
-const contract = @import("contract.zig");
+const contract = @import("ces_contract.zig");
 const fault_guards = @import("fault_guards.zig");
 const types = @import("types.zig");
 const internal = @import("engine_internal.zig");
@@ -224,3 +224,4 @@ pub fn run(api: *const rio_mod.Api, options: *const types.Options, stop: *std.at
     }
     return if (failed) .network else .success;
 }
+

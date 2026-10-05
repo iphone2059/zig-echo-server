@@ -1,6 +1,6 @@
 pub const types = @import("types.zig");
-pub const options = @import("options.zig");
-pub const contract = @import("contract.zig");
+pub const options = @import("ces_contract.zig");
+pub const contract = @import("ces_contract.zig");
 pub const timer_heap = @import("timer_heap.zig");
 pub const sdk = @import("sdk.zig");
 pub const win32 = @import("win32.zig");
@@ -26,3 +26,4 @@ test {
     _ = tcp_acceptor;
     _ = engine;
 }
+
