@@ -240,8 +240,8 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
         }
     }
 
-    if (out.protocol == .tcp and saw_udp_depth) return fail(error_buffer, tokens.protocol_option);
-    if (out.protocol == .udp and saw_timeout) return fail(error_buffer, tokens.protocol_option);
+    if (out.protocol == .tcp and saw_udp_depth and switchInfo("k").?.scope == .udp_only) return fail(error_buffer, tokens.protocol_option);
+    if (out.protocol == .udp and saw_timeout and switchInfo("t").?.scope == .tcp_only) return fail(error_buffer, tokens.protocol_option);
     if (out.help) return true;
     if (out.protocol == .none) return fail(error_buffer, "missing /p tcp or /p udp");
     if (out.protocol == .udp) {
