@@ -170,7 +170,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
     var index: usize = 1;
     while (index < argv.len) : (index += 1) {
         const token = argv[index];
-        if (!isSwitch(token)) return fail(error_buffer, "server does not accept positional arguments");
+        if (!isSwitch(token)) return fail(error_buffer, "unexpected-target");
         const offset: usize = if (token.len > 1 and token[0] == '-' and token[1] == '-') 2 else 1;
         const body = token[offset..];
         const separator = std.mem.indexOfScalar(u8, body, '=');
@@ -243,7 +243,7 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
     if (out.protocol == .tcp and saw_udp_depth and switchInfo("k").?.scope == .udp_only) return fail(error_buffer, tokens.protocol_option);
     if (out.protocol == .udp and saw_timeout and switchInfo("t").?.scope == .tcp_only) return fail(error_buffer, tokens.protocol_option);
     if (out.help) return true;
-    if (out.protocol == .none) return fail(error_buffer, "missing /p tcp or /p udp");
+    if (out.protocol == .none) return fail(error_buffer, "missing-protocol");
     if (out.protocol == .udp) {
         if (!saw_rio_buffer) {
             out.rio_buffer_bytes = types.max_udp_payload;
