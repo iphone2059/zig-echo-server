@@ -3,7 +3,7 @@ $ErrorActionPreference='Stop'
 
 $child=Start-Process -FilePath (Get-Command pwsh).Source `
     -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') `
-    -WindowStyle Hidden -PassThru
+    -NoNewWindow -PassThru
 $childId=$child.Id
 try {
     $timedOut=$false

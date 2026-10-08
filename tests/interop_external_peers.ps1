@@ -38,7 +38,7 @@ foreach ($peer in $peers) {
         $serverArgs+=@('/rio-buffer','65507','/cq','8192','/memory','134217728','/q','/stats')
         $serverStdout=Join-Path $directory 'server.stdout.txt'
         $serverStderr=Join-Path $directory 'server.stderr.txt'
-        $process=Start-Process -FilePath $serverExe -ArgumentList $serverArgs -WindowStyle Hidden -PassThru `
+        $process=Start-Process -FilePath $serverExe -ArgumentList $serverArgs -NoNewWindow -PassThru `
             -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr
         try {
             Start-Sleep -Milliseconds 400
@@ -49,7 +49,7 @@ foreach ($peer in $peers) {
             $clientArgs+=@('/z',[string]$case.payload,'/cq','8192','/memory','134217728','/q','/stats')
             $clientStdout=Join-Path $directory 'client.stdout.txt'
             $clientStderr=Join-Path $directory 'client.stderr.txt'
-            $client=Start-Process -FilePath $peer.path -ArgumentList $clientArgs -WindowStyle Hidden -PassThru `
+            $client=Start-Process -FilePath $peer.path -ArgumentList $clientArgs -NoNewWindow -PassThru `
                 -RedirectStandardOutput $clientStdout -RedirectStandardError $clientStderr
             try {
                 Wait-InteropChild -Process $client -TimeoutMilliseconds 60000 -Description "$($peer.name)/$($case.name)"

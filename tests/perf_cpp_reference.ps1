@@ -45,12 +45,12 @@ $serverStdout=Join-Path $runDirectory 'server.stdout.txt'
 $serverStderr=Join-Path $runDirectory 'server.stderr.txt'
 $clientStdout=Join-Path $runDirectory 'client.stdout.txt'
 $clientStderr=Join-Path $runDirectory 'client.stderr.txt'
-$server=Start-Process -FilePath $serverExe -ArgumentList $serverArguments -WindowStyle Hidden -PassThru `
+$server=Start-Process -FilePath $serverExe -ArgumentList $serverArguments -NoNewWindow -PassThru `
     -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr
 try {
     Start-Sleep -Milliseconds 500
     if ($server.HasExited) { throw "C++ reference server exited during startup: $runDirectory" }
-    $client=Start-Process -FilePath $clientExe -ArgumentList $clientArguments -WindowStyle Hidden -PassThru `
+    $client=Start-Process -FilePath $clientExe -ArgumentList $clientArguments -NoNewWindow -PassThru `
         -RedirectStandardOutput $clientStdout -RedirectStandardError $clientStderr
     $timer=[Diagnostics.Stopwatch]::StartNew()
     try {

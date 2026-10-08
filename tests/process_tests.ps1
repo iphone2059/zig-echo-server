@@ -77,7 +77,7 @@ try {
     $serverTcpStdout = Join-Path $scratch 'server-tcp.stdout.txt'
     $serverTcpStderr = Join-Path $scratch 'server-tcp.stderr.txt'
     $serverTcpPort = Get-FreeTcpPort
-    $serverTcpProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'tcp', '/s', $serverTcpPort, '/threads', '2', '/t', '1', '/w', '3', '/rio-buffer', '4096', '/cq', '256', '/memory', '67108864', '/q', '/stats') -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverTcpStdout -RedirectStandardError $serverTcpStderr
+    $serverTcpProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'tcp', '/s', $serverTcpPort, '/threads', '2', '/t', '1', '/w', '3', '/rio-buffer', '4096', '/cq', '256', '/memory', '67108864', '/q', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $serverTcpStdout -RedirectStandardError $serverTcpStderr
     Start-Sleep -Milliseconds 400
     if ($serverTcpProcess.HasExited) { throw "TCP server exited during startup with code $($serverTcpProcess.ExitCode): $(Get-Content -Raw $serverTcpStderr)" }
     if ($client) {
@@ -100,7 +100,7 @@ try {
     $tcpStdout = Join-Path $scratch 'tcp.stdout.txt'
     $tcpStderr = Join-Path $scratch 'tcp.stderr.txt'
     $tcpPort = Get-FreeTcpPort
-    $tcpProcess = Start-Process -FilePath $tcpDriver -ArgumentList @($tcpPort, 6, 4, 8192, 1) -WindowStyle Hidden -PassThru -RedirectStandardOutput $tcpStdout -RedirectStandardError $tcpStderr
+    $tcpProcess = Start-Process -FilePath $tcpDriver -ArgumentList @($tcpPort, 6, 4, 8192, 1) -NoNewWindow -PassThru -RedirectStandardOutput $tcpStdout -RedirectStandardError $tcpStderr
     Start-Sleep -Milliseconds 400
     if ($tcpProcess.HasExited) { throw "TCP acceptor driver exited during startup: $(Get-Content -Raw $tcpStderr)" }
 
@@ -161,7 +161,7 @@ try {
     $stormReady = Join-Path $scratch 'storm.ready.txt'
     $stormCount = Join-Path $scratch 'storm.count.txt'
     $stormScript = Join-Path $PSScriptRoot 'tcp_storm.ps1'
-    $stormProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$stormScript`"", '-Port', "$tcpPort", '-ReadyPath', "`"$stormReady`"", '-CounterPath', "`"$stormCount`"") -WindowStyle Hidden -PassThru
+    $stormProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', "`"$stormScript`"", '-Port', "$tcpPort", '-ReadyPath', "`"$stormReady`"", '-CounterPath', "`"$stormCount`"") -NoNewWindow -PassThru
     $stormReadyUntil = [DateTime]::UtcNow.AddSeconds(5)
     while (-not (Test-Path -LiteralPath $stormReady) -and [DateTime]::UtcNow -lt $stormReadyUntil) { Start-Sleep -Milliseconds 20 }
     if (-not (Test-Path -LiteralPath $stormReady)) { throw 'TCP shutdown storm did not start' }
@@ -176,7 +176,7 @@ try {
     if ($tcpError.Length -ne 0) { throw "Successful TCP acceptor driver wrote to stderr: $tcpError" }
     if ($tcpOutput -notmatch '^tcp_driver active=0 failed=false\r?\n?$') { throw "TCP acceptor terminal state mismatch: $tcpOutput" }
 
-    $serverProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'udp', '/s', $port, '/w', '3', '/k', '64', '/cq', '256', '/memory', '67108864', '/q', '/stats') -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $serverProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'udp', '/s', $port, '/w', '3', '/k', '64', '/cq', '256', '/memory', '67108864', '/q', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     Start-Sleep -Milliseconds 350
     if ($serverProcess.HasExited) {
         throw "UDP server exited during startup with code $($serverProcess.ExitCode): $(Get-Content -Raw $stderrPath)"
@@ -230,7 +230,7 @@ try {
     $stopStdout = Join-Path $scratch 'stop.stdout.txt'
     $stopStderr = Join-Path $scratch 'stop.stderr.txt'
     $stopPort = Get-FreeUdpPort
-    $stopProcess = Start-Process -FilePath $stopDriver -ArgumentList @($stopPort) -WindowStyle Hidden -PassThru -RedirectStandardOutput $stopStdout -RedirectStandardError $stopStderr
+    $stopProcess = Start-Process -FilePath $stopDriver -ArgumentList @($stopPort) -NoNewWindow -PassThru -RedirectStandardOutput $stopStdout -RedirectStandardError $stopStderr
     Start-Sleep -Milliseconds 250
     if ($client) {
         & $client 127.0.0.1 /p udp /r $stopPort /n 1000000 /c 16 /threads 2 /z 256 /w 1 /q 2>$null

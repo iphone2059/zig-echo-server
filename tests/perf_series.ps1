@@ -34,7 +34,7 @@ $seriesDirectory=Join-Path $OutputDirectory $seriesId
 $null=New-Item -ItemType Directory -Path $seriesDirectory -Force
 $serverStdout=Join-Path $seriesDirectory 'server.stdout.txt'
 $serverStderr=Join-Path $seriesDirectory 'server.stderr.txt'
-$process=Start-Process -FilePath $serverExe -ArgumentList $serverArguments -WindowStyle Hidden -PassThru `
+$process=Start-Process -FilePath $serverExe -ArgumentList $serverArguments -NoNewWindow -PassThru `
     -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr
 $runPaths=[Collections.Generic.List[string]]::new()
 $frozenCount=[long]$workload.echo_count
