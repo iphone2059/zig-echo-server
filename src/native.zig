@@ -419,26 +419,37 @@ pub const socket = struct {
         return c.WSASocketW(c.AF_INET, socket_type, protocol, null, 0, registeredFlags());
     }
 
-    pub fn configure(value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) bool {
+    /// Which stage of a socket configuration failed, and the status that call produced.
+    ///
+    /// The status is captured where it happened and travels back with the result rather than being
+    /// re-queried by the caller. Reporting it from inside the failing call is not enough on its own:
+    /// report() writes to the console, and that write can replace the thread's last error before
+    /// anyone reads it. Naming the stage keeps Accept Context, the socket buffers and TCP_NODELAY
+    /// distinguishable instead of collapsing them into one socket error.
+    pub const SocketFailure = struct {
+        stage: []const u8,
+        native_error: i32,
+    };
+
+    /// Returns null on success, or the failing stage and its status.
+    pub fn configure(value: c.SOCKET, socket_buffer_bytes: u32, tcp: bool) ?SocketFailure {
         if (socket_buffer_bytes != 0) {
             var size: c_int = @intCast(socket_buffer_bytes);
             const pointer: [*c]const u8 = @ptrCast(&size);
             if (c.setsockopt(value, c.SOL_SOCKET, c.SO_SNDBUF, pointer, @intCast(@sizeOf(c_int))) != 0 or
                 c.setsockopt(value, c.SOL_SOCKET, c.SO_RCVBUF, pointer, @intCast(@sizeOf(c_int))) != 0)
             {
-                diagnostics.report("setsockopt(SO_SNDBUF/SO_RCVBUF)", @intCast(c.WSAGetLastError()));
-                return false;
+                return .{ .stage = "setsockopt(SO_SNDBUF/SO_RCVBUF)", .native_error = @intCast(c.WSAGetLastError()) };
             }
         }
         if (tcp) {
             var enabled: c.BOOL = c.TRUE;
             const pointer: [*c]const u8 = @ptrCast(&enabled);
             if (c.setsockopt(value, c.IPPROTO_TCP, c.TCP_NODELAY, pointer, @intCast(@sizeOf(c.BOOL))) != 0) {
-                diagnostics.report("setsockopt(TCP_NODELAY)", @intCast(c.WSAGetLastError()));
-                return false;
+                return .{ .stage = "setsockopt(TCP_NODELAY)", .native_error = @intCast(c.WSAGetLastError()) };
             }
         }
-        return true;
+        return null;
     }
 };
 
@@ -814,13 +825,12 @@ pub const endpoint = struct {
 
     /// An accepted socket only becomes usable for RIO once the accept context has been updated;
     /// the failure is not optional and is reported with the failing stage.
-    pub fn updateAcceptContext(socket_value: c.SOCKET, listener: c.SOCKET) bool {
+    pub fn updateAcceptContext(socket_value: c.SOCKET, listener: c.SOCKET) ?socket.SocketFailure {
         var listener_value = listener;
         if (c.setsockopt(socket_value, c.SOL_SOCKET, c.SO_UPDATE_ACCEPT_CONTEXT, @ptrCast(&listener_value), @sizeOf(c.SOCKET)) != 0) {
-            diagnostics.report("setsockopt(SO_UPDATE_ACCEPT_CONTEXT)", @intCast(c.WSAGetLastError()));
-            return false;
+            return .{ .stage = "setsockopt(SO_UPDATE_ACCEPT_CONTEXT)", .native_error = @intCast(c.WSAGetLastError()) };
         }
-        return true;
+        return null;
     }
 
     fn loadExtension(comptime T: type, socket_value: c.SOCKET, identifier_value: c.GUID, stage: []const u8) ?T {

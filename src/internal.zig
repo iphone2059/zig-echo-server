@@ -1092,12 +1092,14 @@ pub const acceptor = struct {
     /// take a worker credit and publish. All of it is I/O -- the slot is already in transit, so a
     /// failure here retires it rather than re-deciding.
     fn executeHandoff(self: *Acceptor, operation: *Operation, candidate: u32) void {
-        if (!native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) or
-            !native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true))
-        {
+        const configuration = native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) orelse
+            native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true);
+        if (configuration) |failure| {
+            // The status was captured at the call that produced it, so the transition and the socket
+            // cleanup below cannot replace the reason this failed.
             if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
-            failAndStop(self, "accepted socket configuration", @intCast(c.WSAGetLastError()));
+            failAndStop(self, failure.stage, @bitCast(failure.native_error));
             return;
         }
         var local: ?*c.SOCKADDR = null;
@@ -1229,7 +1231,10 @@ pub const acceptor = struct {
             native.diagnostics.report("TCP acceptor event creation", c.GetLastError());
             return error.ReadyEvent;
         }
-        if (!native.socket.configure(self.listener.get(), options.socket_buffer_bytes, true)) return error.ConfigureSocket;
+        if (native.socket.configure(self.listener.get(), options.socket_buffer_bytes, true)) |failure| {
+            native.diagnostics.report(failure.stage, @bitCast(failure.native_error));
+            return error.ConfigureSocket;
+        }
         if (!native.endpoint.bindEndpoint(self.listener.get(), options.port) or !native.endpoint.listenEndpoint(self.listener.get())) {
             return error.BindListen;
         }
@@ -1573,7 +1578,10 @@ pub const udp = struct {
                 native.diagnostics.report("WSASocketW(UDP RIO)", @bitCast(c.WSAGetLastError()));
                 return .network;
             }
-            if (!native.socket.configure(socket_owner.get(), options.socket_buffer_bytes, false)) return .network;
+            if (native.socket.configure(socket_owner.get(), options.socket_buffer_bytes, false)) |failure| {
+            native.diagnostics.report(failure.stage, @bitCast(failure.native_error));
+            return .network;
+        }
 
             var port = native.handle.Handle{};
             defer port.deinit();
