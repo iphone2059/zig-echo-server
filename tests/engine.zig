@@ -220,8 +220,8 @@ test "the RIO request context round trips and rejects a forged value" {
 test "the datagram engine owns the direction and the in-flight ledger" {
     // The engine is pure, so the whole slot cycle is replayed here with no socket, request queue or
     // completion port in the room.
-    var directions: [2]types.EngineOperation = undefined;
-    var engine_value = udp.Engine.init(&directions);
+    var slot_states: [2]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
     try std.testing.expect(!engine_value.hasWork());
     try std.testing.expect(engine_value.mayRelease());
 
@@ -232,11 +232,11 @@ test "the datagram engine owns the direction and the in-flight ledger" {
     try std.testing.expectEqual(types.EngineOperation.receive, engine_value.direction(0));
 
     // A completed receive echoes its exact length, and the send it arms is what the ledger holds.
-    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 7, 1024));
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(0, types.error_success, 7, 1024));
     try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
     engine_value.onPosted(0, .send);
     try std.testing.expectEqual(types.EngineOperation.send, engine_value.direction(0));
-    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(.send, types.error_success, 7, 1024));
+    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(0, types.error_success, 7, 1024));
     try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
 
     // The ledger and the statistics are the engine's, not the loop's.
@@ -250,12 +250,14 @@ test "the datagram engine owns the direction and the in-flight ledger" {
     // A closed socket retires what is still in flight without arming anything further, and the slot
     // that was never echoed is what the last completion returns.
     engine_value.beginClose();
-    try std.testing.expectEqual(udp.Action.drop, engine_value.onCompletion(.receive, types.error_success, 7, 1024));
+    // Slot one is still outstanding, so it retires under the close and arms nothing. Slot zero came
+    // home before the close and is refused rather than retired a second time.
+    try std.testing.expectEqual(udp.Action.drop, engine_value.onCompletion(1, types.error_success, 7, 1024));
     try std.testing.expect(!engine_value.hasWork());
     try std.testing.expect(engine_value.mayRelease());
 
-    // One retirement past the ledger is an invariant failure, not a decrement under zero.
-    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(.receive, types.error_success, 0, 1024));
+    // One retirement past the per-slot ledger is an invariant failure, not a decrement under zero.
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(0, types.error_success, 0, 1024));
     try std.testing.expect(!engine_value.hasWork());
 }
 
@@ -552,10 +554,10 @@ test "a zero length datagram is echoed as a zero length send" {
     // Mirrors a_zero_length_datagram_is_echoed_as_a_zero_length_send. A completed receive always
     // echoes, including a datagram that carried nothing, and the length it echoes is exactly the
     // length it received.
-    var directions: [1]types.EngineOperation = undefined;
-    var engine_value = udp.Engine.init(&directions);
+    var slot_states: [1]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
     engine_value.onPosted(0, .receive);
-    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 0, 65_507));
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(0, types.error_success, 0, 65_507));
     try std.testing.expectEqual(@as(u32, 0), udp.receiveLength(0, 65_507));
 }
 
@@ -563,13 +565,13 @@ test "a connection reset returns the slot to receiving without counting a send" 
     // Mirrors a_connection_reset_returns_the_slot_to_receiving. The socket survives an ICMP
     // port-unreachable: a reset send is a completion but not traffic, so it is not reported as a send
     // and carries no bytes, while the receive that preceded it still counts.
-    var directions: [1]types.EngineOperation = undefined;
-    var engine_value = udp.Engine.init(&directions);
+    var slot_states: [1]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
     engine_value.onPosted(0, .receive);
-    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 0, 65_507));
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(0, types.error_success, 0, 65_507));
     engine_value.onPosted(0, .send);
     try std.testing.expectEqual(types.EngineOperation.send, engine_value.direction(0));
-    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(.send, types.wsa_econnreset, 0, 65_507));
+    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(0, types.wsa_econnreset, 0, 65_507));
     try std.testing.expect(!engine_value.closing);
     try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sends);
     try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sent_bytes);
@@ -601,4 +603,64 @@ test "an acknowledgement decides the next step and refuses an unowned one" {
     core.stop();
     try std.testing.expectEqual(acceptor.AcceptAction.none, core.onAck(0));
     try std.testing.expectEqual(@as(u32, 0), core.liveCount());
+}
+test "the datagram ledger refuses a repeated completion for one slot" {
+    // Two slots are in flight and the first one's completion arrives twice. With only a total to
+    // compare against, the repeat would drain the ledger to zero while slot one still owns an
+    // operation; the per-slot flag is what refuses it instead.
+    var slot_states: [2]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
+    engine_value.onPosted(0, .receive);
+    engine_value.onPosted(1, .receive);
+    try std.testing.expectEqual(@as(u32, 2), engine_value.outstanding);
+
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(0, types.error_success, 7, 1024));
+    try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
+    try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.network_errors);
+
+    // The repeat is an invariant failure, and it leaves the ledger and the slot alone.
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(0, types.error_success, 7, 1024));
+    try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.completions);
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.receives);
+
+    // The second slot is untouched and still retires exactly once.
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(1, types.error_success, 7, 1024));
+    try std.testing.expectEqual(@as(u32, 0), engine_value.outstanding);
+    try std.testing.expect(engine_value.mayRelease());
+}
+
+test "a completion for a slot that was never posted is refused" {
+    // Mirrors the reference's per-slot invariant. An index outside the table is refused too, rather
+    // than being absorbed by the total.
+    var slot_states: [1]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
+    engine_value.onPosted(0, .receive);
+    // An index outside the table is refused by the total, not absorbed by it.
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(1, types.error_success, 0, 1024));
+    try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
+    // The genuine completion retires the slot; the repeat for that same slot is then refused.
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(0, types.error_success, 0, 1024));
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(0, types.error_success, 0, 1024));
+    try std.testing.expectEqual(@as(u32, 0), engine_value.outstanding);
+}
+
+test "a refused post and a failed completion are both network errors" {
+    // Mirrors the reference's on_post_failure and its non-success completion accounting: the socket
+    // survives both, so neither may be silent in the final line.
+    var slot_states: [1]udp.SlotState = undefined;
+    var engine_value = udp.Engine.init(&slot_states);
+    engine_value.onPostFailure();
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.network_errors);
+
+    engine_value.onPosted(0, .send);
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(0, types.error_invalid_data, 0, 1024));
+    try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sends);
+    try std.testing.expectEqual(@as(u64, 2), engine_value.statistics.network_errors);
+
+    // A reset recovers the slot, and it is a network error too: the socket survives, but the event is
+    // not silent.
+    engine_value.onPosted(0, .send);
+    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(0, types.wsa_econnreset, 0, 1024));
+    try std.testing.expectEqual(@as(u64, 3), engine_value.statistics.network_errors);
 }

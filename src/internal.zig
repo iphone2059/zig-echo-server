@@ -1368,6 +1368,17 @@ pub const udp = struct {
     /// What one completion means for its slot.
     pub const Action = enum(u8) { repost_receive, repost_send, drop, fatal };
 
+    /// The pure state of one datagram slot: the direction it is armed in, and whether the provider
+    /// still owns an operation for it.
+    ///
+    /// The two belong together. A direction without ownership cannot tell a genuine completion from
+    /// a repeated one, and an ownership flag without a direction cannot decide what the completion
+    /// means, so the pair is the unit the ledger is kept in.
+    pub const SlotState = struct {
+        direction: types.EngineOperation = .receive,
+        outstanding: bool = false,
+    };
+
     /// The pure UDP engine: which direction each slot is armed in, the in-flight ledger, the error
     /// classification and the statistics.
     ///
@@ -1377,7 +1388,7 @@ pub const udp = struct {
     pub const Engine = struct {
         /// The direction each slot is currently armed in. Ownership of a slot lives here, next to
         /// the ledger it feeds, rather than in the native record the kernel writes.
-        directions: []types.EngineOperation = &.{},
+        slots: []SlotState = &.{},
         /// Operations the provider still owns. The loop may only end, and the arena may only be
         /// released, once this is back to zero.
         outstanding: u32 = 0,
@@ -1385,19 +1396,28 @@ pub const udp = struct {
         /// The socket is closed, so no further post is legitimate and completions only retire.
         closing: bool = false,
 
-        pub fn init(directions: []types.EngineOperation) Engine {
-            @memset(directions, .receive);
-            return .{ .directions = directions };
+        pub fn init(slots: []SlotState) Engine {
+            for (slots) |*slot| slot.* = .{};
+            return .{ .slots = slots };
         }
 
         pub fn direction(self: *const Engine, index: u32) types.EngineOperation {
-            return if (index < self.directions.len) self.directions[index] else .receive;
+            return if (index < self.slots.len) self.slots[index].direction else .receive;
         }
 
-        /// The runtime armed a slot, so ownership moved to the provider.
+        /// The runtime armed a slot, so ownership of that one slot moved to the provider. The
+        /// per-slot flag and the total move together, which is what makes the pair exact.
         pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) void {
-            if (index < self.directions.len) self.directions[index] = operation;
+            if (index < self.slots.len) {
+                self.slots[index] = .{ .direction = operation, .outstanding = true };
+            }
             self.outstanding +%= 1;
+        }
+
+        /// A post the runtime attempted and the provider refused. The slot never became outstanding,
+        /// so only the ledger of failures moves.
+        pub fn onPostFailure(self: *Engine) void {
+            self.statistics.network_errors +%= 1;
         }
 
         pub fn hasWork(self: *const Engine) bool {
@@ -1417,8 +1437,15 @@ pub const udp = struct {
 
         /// One completion: ownership is retired and the ledger and statistics move before the action
         /// is decided, so a completion can never be accounted twice or steered twice.
-        pub fn onCompletion(self: *Engine, operation: types.EngineOperation, status: i32, bytes: u32, capacity: u32) Action {
-            if (self.outstanding == 0) return .fatal;
+        pub fn onCompletion(self: *Engine, index: u32, status: i32, bytes: u32, capacity: u32) Action {
+            // The per-slot ownership is checked and retired first. A duplicated completion for one
+            // slot must not retire another slot's operation: with only the total to compare against,
+            // two outstanding slots and a repeated completion for one of them would drain the ledger
+            // to zero while an operation is still with the provider.
+            if (index >= self.slots.len) return .fatal;
+            if (!self.slots[index].outstanding or self.outstanding == 0) return .fatal;
+            const operation = self.slots[index].direction;
+            self.slots[index].outstanding = false;
             self.outstanding -= 1;
             self.statistics.completions +%= 1;
             switch (operation) {
@@ -1436,6 +1463,9 @@ pub const udp = struct {
                     }
                 },
             }
+            // A failure outside the closing drain is a network error, which is how the reference
+            // counts a reset or a refused request even though the socket survives it.
+            if (status != types.error_success and !self.closing) self.statistics.network_errors +%= 1;
             if (self.closing) return .drop;
             return classify(operation, status, bytes, capacity);
         }
@@ -1563,11 +1593,11 @@ pub const udp = struct {
             };
             defer arena_value.deinit();
 
-            const directions = allocator.alloc(types.EngineOperation, options.udp_depth) catch {
-                native.diagnostics.report("allocate UDP directions", c.ERROR_NOT_ENOUGH_MEMORY);
+            const slot_states = allocator.alloc(SlotState, options.udp_depth) catch {
+                native.diagnostics.report("allocate UDP slot states", c.ERROR_NOT_ENOUGH_MEMORY);
                 return .network;
             };
-            defer allocator.free(directions);
+            defer allocator.free(slot_states);
             const slots = allocator.alloc(Slot, options.udp_depth) catch {
                 native.diagnostics.report("allocate UDP slots", c.ERROR_NOT_ENOUGH_MEMORY);
                 return .network;
@@ -1605,11 +1635,12 @@ pub const udp = struct {
                 return .network;
             }
 
-            var engine_value = Engine.init(directions);
+            var engine_value = Engine.init(slot_states);
             var failed = false;
             for (0..options.udp_depth) |position| {
                 const index: u32 = @intCast(position);
                 if (!postReceive(api, request_queue, &arena_value, slots, index, capacity)) {
+                    engine_value.onPostFailure();
                     failed = true;
                     break;
                 }
@@ -1651,11 +1682,11 @@ pub const udp = struct {
                             const raw = result.RequestContext orelse failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);
                             const slot: *Slot = @ptrCast(@alignCast(raw));
                             const index = validSlot(slots, slot) orelse failFast("UDP completion identity", c.ERROR_INVALID_DATA);
-                            const operation = engine_value.direction(index);
-                            switch (engine_value.onCompletion(operation, result.Status, result.BytesTransferred, capacity)) {
+                            switch (engine_value.onCompletion(index, result.Status, result.BytesTransferred, capacity)) {
                                 .repost_receive => {
                                     if (!postReceive(api, request_queue, &arena_value, slots, index, capacity)) {
                                         native.diagnostics.report("UDP receive repost", @intCast(c.WSAGetLastError()));
+                                        engine_value.onPostFailure();
                                         failed = true;
                                         engine_value.beginClose();
                                         socket_owner.deinit();
@@ -1669,6 +1700,7 @@ pub const udp = struct {
                                     const length = receiveLength(result.BytesTransferred, capacity);
                                     if (!postSend(api, request_queue, &arena_value, slots, index, length, capacity)) {
                                         native.diagnostics.report("UDP send repost", @intCast(c.WSAGetLastError()));
+                                        engine_value.onPostFailure();
                                         failed = true;
                                         engine_value.beginClose();
                                         socket_owner.deinit();
