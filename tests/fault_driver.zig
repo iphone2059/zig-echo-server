@@ -25,6 +25,24 @@ pub fn main(init: std.process.Init) u8 {
     if (std.mem.eql(u8, mode, "control_post_failure")) {
         server.native.guards.requireControlPost(c.FALSE, 5, "PostQueuedCompletionStatus(worker stop)");
     }
+    if (std.mem.eql(u8, mode, "partial_worker_start")) {
+        // A real coordinator run in which the third of four workers never gets a thread. Reaching a
+        // clean bounded exit proves what the exit code alone cannot: the two workers that did start
+        // were joined before anything was released, and the worker whose storage exists without a
+        // thread was released without touching uninitialised native state. A release that ran early
+        // would corrupt or hang instead of returning an exit code.
+        server.server.injectWorkerStartFailure(2);
+        const options = server.types.Options{
+            .protocol = .tcp,
+            .port = 0,
+            .worker_count = 4,
+            .run_seconds = 1,
+            .timeout_seconds = 1,
+            .quiet = true,
+            .stats = true,
+        };
+        return @intFromEnum(server.server.runServer(&options));
+    }
     if (std.mem.eql(u8, mode, "worker_not_started")) {
         // The other half of a partially failed startup: a worker whose tcp.start never produced a
         // thread. Its storage still exists and is released by the cleanup scope, but it must not be

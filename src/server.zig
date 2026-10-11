@@ -57,6 +57,17 @@ pub fn slotCapacity(options: *const types.Options, worker_count: u32, worker_ind
     return contract.tcpConnectionCapacity(options.cq_capacity, budget / options.rio_buffer_bytes);
 }
 
+/// A worker start that must fail on purpose. A real CreateThread refusal cannot be provoked from
+/// outside, and the partial-startup cleanup path is the one place where a worker exists without a
+/// thread; this stands in for it. Only the fault driver arms it, so a shipped binary always runs with
+/// it unarmed and behaves identically.
+var injected_start_failure: ?u32 = null;
+
+/// Arms the injection above for the next run. Test-only.
+pub fn injectWorkerStartFailure(index: ?u32) void {
+    injected_start_failure = index;
+}
+
 /// The coordinator's worker ownership guard. After every thread is joined, a worker that did not
 /// retire its operations still has registered memory and OVERLAPPED records Windows can reach, so
 /// releasing it would be a use-after-free rather than a recoverable shutdown error.
@@ -112,6 +123,16 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
         // must be released -- while started_workers is the threads that actually run, which is what the
         // reference reports.
         initialized += 1;
+        if (injected_start_failure) |failure_index| {
+            if (failure_index == position) {
+                // Stands in for a thread the operating system refused, one step after this worker's
+                // storage exists and one step before it has a thread. The cleanup scope must still
+                // cover it, and every worker that did start must still be joined.
+                native.diagnostics.report("CreateThread(worker)", c.ERROR_NOT_ENOUGH_MEMORY);
+                failed.store(true, .release);
+                break;
+            }
+        }
         if (!tcp.start(wrk)) {
             failed.store(true, .release);
             break;

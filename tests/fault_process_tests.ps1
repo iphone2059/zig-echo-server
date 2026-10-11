@@ -57,6 +57,19 @@ try {
     $notStartedError = Get-Content -Raw -LiteralPath $notStartedStderr
     if ($notStartedError.Length -ne 0) { throw "worker_not_started wrote stderr: $notStartedError" }
 
+    # The end-to-end partial startup: four workers, the third never gets a thread. A clean bounded
+    # exit is the assertion -- the two threads that did start were joined before anything was
+    # released, and the worker whose storage exists without a thread was released without touching
+    # uninitialised native state. A release that ran before the joins could not produce this.
+    $partialStdout = Join-Path $scratch 'partial_worker_start.stdout.txt'
+    $partialStderr = Join-Path $scratch 'partial_worker_start.stderr.txt'
+    $partialExit = Invoke-Fault -Mode 'partial_worker_start' -Stdout $partialStdout -Stderr $partialStderr
+    if ($partialExit -ne 2) { throw "partial_worker_start exited $partialExit, expected 2 (network)." }
+    $partialError = Get-Content -Raw -LiteralPath $partialStderr
+    if (-not $partialError.Contains('CreateThread(worker)')) { throw "partial_worker_start stderr mismatch: $partialError" }
+    $partialOutput = ((Get-Content -Raw -LiteralPath $partialStdout) -replace '\s+',' ').Trim()
+    if ($partialOutput -notmatch 'workers=2\b') { throw "partial_worker_start must report the two threads it started: $partialOutput" }
+
     Write-Host 'fault_process_tests: PASS'
 }
 finally {
