@@ -195,8 +195,9 @@ try {
     if (-not (Test-Path -LiteralPath $stopOwnershipDriver -PathType Leaf)) { throw "Missing TCP stop-ownership driver: $stopOwnershipDriver" }
     $ownershipStdout = Join-Path $scratch 'ownership.stdout.txt'
     $ownershipStderr = Join-Path $scratch 'ownership.stderr.txt'
-    $ownershipPort = Get-FreeTcpPort
-    $ownershipProcess = Start-Process -FilePath $stopOwnershipDriver -ArgumentList @(8, $ownershipPort) -NoNewWindow -PassThru -RedirectStandardOutput $ownershipStdout -RedirectStandardError $ownershipStderr
+    # A port below the ephemeral range, because this driver rebinds the same port every round and
+    # Windows may hand an ephemeral port to something else while the run is in progress.
+    $ownershipProcess = Start-Process -FilePath $stopOwnershipDriver -ArgumentList @(8, 25000) -NoNewWindow -PassThru -RedirectStandardOutput $ownershipStdout -RedirectStandardError $ownershipStderr
     if (-not $ownershipProcess.WaitForExit(60000)) { throw 'TCP stop-ownership driver did not converge.' }
     if ($ownershipProcess.ExitCode -ne 0) { throw "TCP stop-ownership driver failed with exit code $($ownershipProcess.ExitCode): $(Get-Content -Raw $ownershipStderr)" }
     $ownershipError = Get-Content -Raw -LiteralPath $ownershipStderr

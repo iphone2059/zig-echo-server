@@ -18,10 +18,17 @@ const c = server.native.sdk.c;
 const acceptor = server.acceptor;
 const tcp = server.tcp;
 
+fn native_report(stage: []const u8, native_error: u32) void {
+    server.native.diagnostics.report(stage, native_error);
+}
+
 pub fn main(init: std.process.Init) u8 {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return 4;
     if (argv.len != 3) return 1;
     const rounds = std.fmt.parseInt(u32, argv[1], 10) catch return 1;
+    // One port for the whole run, chosen by the caller outside its ephemeral range: the listener is
+    // released and rebound after every round, and Windows may reassign a port in that range while the
+    // round is running, which would turn a bind collision into a spurious failure.
     const base_port = std.fmt.parseInt(u16, argv[2], 10) catch return 1;
 
     var options: server.types.Options = .{
@@ -57,9 +64,14 @@ pub fn main(init: std.process.Init) u8 {
 
     var round: u32 = 0;
     while (round < rounds) : (round += 1) {
-        options.port = base_port +% @as(u16, @intCast(round));
+        options.port = base_port;
         var value: acceptor.Acceptor = .{};
-        acceptor.initialize(&value, &api, &options, worker_slice, credits[0..], &failed) catch continue;
+        acceptor.initialize(&value, &api, &options, worker_slice, credits[0..], &failed) catch {
+            // The caller chose this port, so a refusal here is reported rather than skipped: a round
+            // that never ran must not be counted as a round that passed.
+            native_report("bind", @intCast(c.WSAGetLastError()));
+            return 2;
+        };
         if (!acceptor.start(&value)) {
             acceptor.stop(&value);
             acceptor.destroy(&value);
