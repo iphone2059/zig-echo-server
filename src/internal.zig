@@ -715,7 +715,25 @@ pub const acceptor = struct {
     };
 
     /// What the shutdown path must do with one accept operation.
-    pub const Action = enum(u8) { none, close_posted, wait_ack };
+    /// What one AcceptEx completion means, and what the acceptor thread must do next.
+    ///
+    /// This is the reference's AcceptAction. A completion is decided purely, and the decision names
+    /// the slot and, for a handoff, the worker the rotation selected.
+    pub const AcceptAction = union(enum) {
+        /// AcceptEx completed: transfer the socket and publish the handoff to this worker.
+        handoff: struct { index: u32, worker: u32 },
+        /// Post AcceptEx on this slot.
+        repost: u32,
+        /// Admission is broken and the acceptor stops. The field is code rather than error because
+        /// error is a Zig keyword; it carries the same native status the reference calls error.
+        fail: struct { index: u32, code: i32 },
+        /// Nothing to do; the slot stays idle.
+        none,
+    };
+
+    /// What the acceptor does with one slot when it stops. This is a shutdown disposition, not the
+    /// decision a completion produces; that one is AcceptAction above.
+    pub const SlotDisposition = enum(u8) { none, close_posted, wait_ack };
 
     /// Completion statuses an accept can recover from instead of failing the listener. A peer that
     /// resets or is deleted between the accept and the completion is a connection-level event.
@@ -755,6 +773,8 @@ pub const acceptor = struct {
         /// Round-robin cursor over the workers.
         rotation: u32 = 0,
         stopping: bool = false,
+        /// The workers the rotation walks, and the round-robin cursor over them.
+        worker_count: u32 = 0,
         /// Connects refused because every worker's credits were already committed.
         rejected: u64 = 0,
         /// Refused AcceptEx attempts and accept-socket failures, merged into the run's ledger: a
@@ -787,7 +807,7 @@ pub const acceptor = struct {
             return true;
         }
 
-        pub fn actionFor(self: *const Core, index: u32) Action {
+        pub fn dispositionFor(self: *const Core, index: u32) SlotDisposition {
             return switch (self.state(index) orelse .idle) {
                 .idle => .none,
                 .posted => .close_posted,
@@ -816,6 +836,43 @@ pub const acceptor = struct {
 
         pub fn stop(self: *Core) void {
             self.stopping = true;
+        }
+
+        /// One AcceptEx completion, decided purely.
+        ///
+        /// This is the reference's AcceptorCore::on_completion: the slot state moves here and the
+        /// caller is told what to do next, so the decision can be replayed with no listener, no
+        /// completion port and no operation record.
+        pub fn onCompletion(self: *Core, index: u32, completed: bool, code: i32) AcceptAction {
+            const current = self.state(index) orelse
+                return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
+            if (current != .posted) {
+                // A completion for a slot that was never posted means the port is delivering packets
+                // this acceptor does not own.
+                return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
+            }
+            if (!completed) {
+                self.states[index] = .idle;
+                if (self.stopping) return .none;
+                // A connection-level abort leaves the listener healthy, so the slot is reused.
+                if (acceptErrorIsRecoverable(code)) return .{ .repost = index };
+                return .{ .fail = .{ .index = index, .code = code } };
+            }
+            if (self.worker_count == 0) {
+                return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
+            }
+            const candidate = self.rotation % self.worker_count;
+            self.rotation = self.rotation +% 1;
+            self.states[index] = .transit;
+            return .{ .handoff = .{ .index = index, .worker = candidate } };
+        }
+
+        /// Starts the credit scan at the candidate the rotation chose and takes the first worker that
+        /// still has a credit. The candidate is a hint rather than a promise: a saturated worker is
+        /// skipped instead of being handed a socket it would have to refuse.
+        pub fn reserveWorker(self: *Core, candidate: u32, credits: []AdmissionCredits) ?u32 {
+            self.rotation = candidate;
+            return selectWorker(credits, &self.rotation, self.worker_count);
         }
     };
 
@@ -970,7 +1027,7 @@ pub const acceptor = struct {
         for (self.operations) |*operation| {
             // Closing the accepted socket cancels its outstanding AcceptEx; the completion is then
             // retired by the loop instead of leaving the operation posted forever.
-            if (self.core.actionFor(operation.index) == .close_posted) closeAccepted(operation);
+            if (self.core.dispositionFor(operation.index) == .close_posted) closeAccepted(operation);
         }
     }
 
@@ -1161,6 +1218,9 @@ pub const acceptor = struct {
             return error.Operations;
         };
         self.core = Core.init(self.states);
+        // Set after the core is built: Core.init replaces the whole record, so a count written before
+        // it would be wiped and the rotation would have no workers to walk.
+                self.core.worker_count = @intCast(workers.len);
         self.operations = allocator.alloc(Operation, count) catch {
             native.diagnostics.report("allocate accept operations", c.ERROR_NOT_ENOUGH_MEMORY);
             return error.Operations;

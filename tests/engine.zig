@@ -167,17 +167,17 @@ test "the accept table only allows the documented transitions" {
     try std.testing.expectEqual(acceptor.State.posted, core.state(0).?);
     try std.testing.expect(!core.transition(0, .idle, .posted));
     try std.testing.expect(core.transition(0, .posted, .transit));
-    try std.testing.expectEqual(acceptor.Action.wait_ack, core.actionFor(0));
+    try std.testing.expectEqual(acceptor.SlotDisposition.wait_ack, core.dispositionFor(0));
     try std.testing.expect(core.transition(0, .transit, .idle));
-    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
+    try std.testing.expectEqual(acceptor.SlotDisposition.none, core.dispositionFor(0));
     // A posted operation may fall straight back to idle when its AcceptEx was refused or cancelled.
     try std.testing.expect(core.transition(0, .idle, .posted));
     try std.testing.expect(core.transition(0, .posted, .idle));
-    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
+    try std.testing.expectEqual(acceptor.SlotDisposition.none, core.dispositionFor(0));
     // A slot that spent its synchronous attempts yields to a queued repost. It is still live -- the
     // acceptor may not stop while one is outstanding -- and nothing is posted to cancel.
     try std.testing.expect(core.transition(0, .idle, .deferred));
-    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
+    try std.testing.expectEqual(acceptor.SlotDisposition.none, core.dispositionFor(0));
     try std.testing.expectEqual(@as(u32, 1), core.liveCount());
     try std.testing.expectEqual(@as(u32, 0), core.postedCount());
     try std.testing.expect(core.transition(0, .deferred, .idle));
@@ -469,4 +469,49 @@ test "admission credits survive concurrent handoff bursts and retirements" {
     var total: u64 = 0;
     for (acquired) |count| total += count;
     try std.testing.expect(total != 0);
+}
+
+test "the accept completion decision is pure and total" {
+    // The whole decision table is replayed with no listener, no completion port and no operation
+    // record, which is what makes it comparable to the reference's AcceptorCore::on_completion.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    core.worker_count = 2;
+
+    // A completion for a slot that was never posted means the port delivered a packet this acceptor
+    // does not own.
+    const unposted = core.onCompletion(0, true, 0);
+    try std.testing.expectEqual(@as(u32, 0), unposted.fail.index);
+    try std.testing.expectEqual(types.error_invalid_data, unposted.fail.code);
+
+    // A completed accept hands off to the rotation's candidate and moves the slot to transit.
+    _ = core.transition(0, .idle, .posted);
+    try std.testing.expectEqual(@as(u32, 0), core.onCompletion(0, true, 0).handoff.worker);
+    try std.testing.expectEqual(acceptor.State.transit, core.state(0).?);
+    _ = core.transition(0, .transit, .idle);
+
+    // The rotation advanced, so the next handoff names the other worker.
+    _ = core.transition(0, .idle, .posted);
+    try std.testing.expectEqual(@as(u32, 1), core.onCompletion(0, true, 0).handoff.worker);
+    _ = core.transition(0, .transit, .idle);
+
+    // A connection-level abort leaves the listener healthy and reuses the slot.
+    _ = core.transition(0, .idle, .posted);
+    try std.testing.expectEqual(@as(u32, 0), core.onCompletion(0, false, types.wsa_econnreset).repost);
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+
+    // Anything else stops admission with the native status preserved.
+    _ = core.transition(0, .idle, .posted);
+    try std.testing.expectEqual(types.error_not_enough_memory, core.onCompletion(0, false, types.error_not_enough_memory).fail.code);
+
+    // A stopping acceptor retires the slot instead of reposting it.
+    _ = core.transition(0, .idle, .posted);
+    core.stop();
+    try std.testing.expectEqual(acceptor.AcceptAction.none, core.onCompletion(0, false, types.wsa_econnreset));
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+
+    // The rotation's candidate is a hint: a saturated worker is skipped for one with a credit.
+    var credits = [_]acceptor.AdmissionCredits{ acceptor.AdmissionCredits.init(1), acceptor.AdmissionCredits.init(1) };
+    try std.testing.expect(credits[0].tryReserve());
+    try std.testing.expectEqual(@as(?u32, 1), core.reserveWorker(0, &credits));
 }
