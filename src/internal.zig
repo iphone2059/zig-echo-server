@@ -1047,24 +1047,31 @@ pub const acceptor = struct {
         var completion_error: i32 = @bitCast(native_error);
         const completed = c.WSAGetOverlappedResult(self.listener.get(), &operation.overlapped, &accept_bytes, c.FALSE, &flags);
         if (completed == c.FALSE) completion_error = c.WSAGetLastError();
-        if (packet_ok == false and completed == c.FALSE) {
-            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept completion state", c.ERROR_INVALID_STATE);
-            closeAccepted(operation);
-            if (self.core.stopping) return;
-            // A peer that was deleted, reset or aborted between the accept and the completion is a
-            // connection-level event: the listener stays healthy and the slot is reused. The repost
-            // itself carries the bounded synchronous retry and the deferral.
-            if (acceptErrorIsRecoverable(completion_error)) {
+        // The decision is the core's: it moves the slot and names the next step. The loop has already
+        // proved this slot is posted and owned, so the only outcomes here are the ones a real
+        // completion produces, and every one of them is executed below rather than decided here.
+        switch (self.core.onCompletion(operation.index, packet_ok, completion_error)) {
+            .none => return,
+            .fail => |failure| {
+                closeAccepted(operation);
+                failAndStop(self, "AcceptEx completion", @bitCast(failure.code));
+            },
+            .repost => {
+                closeAccepted(operation);
                 if (!postAccept(self, operation)) failAndStop(self, "AcceptEx repost", @bitCast(completion_error));
-                return;
-            }
-            failAndStop(self, "AcceptEx completion", @bitCast(completion_error));
-            return;
+            },
+            .handoff => |handoff| executeHandoff(self, operation, handoff.worker),
         }
+    }
+
+    /// Executes a handoff the core decided: configure the accepted socket, resolve its addresses,
+    /// take a worker credit and publish. All of it is I/O -- the slot is already in transit, so a
+    /// failure here retires it rather than re-deciding.
+    fn executeHandoff(self: *Acceptor, operation: *Operation, candidate: u32) void {
         if (!native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) or
             !native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true))
         {
-            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
+            if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             failAndStop(self, "accepted socket configuration", @intCast(c.WSAGetLastError()));
             return;
@@ -1084,15 +1091,15 @@ pub const acceptor = struct {
             &remote_length,
         );
         if (local == null or remote == null or local_length <= 0 or remote_length <= 0) {
-            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept address state", c.ERROR_INVALID_STATE);
+            if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept address state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             failAndStop(self, "GetAcceptExSockaddrs", c.WSAEINVAL);
             return;
         }
         // Round-robin over the workers that still hold a credit: a saturated worker is never handed
         // a socket it would have to refuse.
-        const worker_index = selectWorker(self.credits, &self.core.rotation, self.workerCount()) orelse {
-            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
+        const worker_index = self.core.reserveWorker(candidate, self.credits) orelse {
+            if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             self.core.rejected +%= 1;
             if (!self.core.transition(operation.index, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
@@ -1101,7 +1108,6 @@ pub const acceptor = struct {
             }
             return;
         };
-        if (!self.core.transition(operation.index, .posted, .transit)) failFast("accept transit state", c.ERROR_INVALID_STATE);
         worker.tcp.postHandoff(&self.workers[worker_index], operation);
     }
 
