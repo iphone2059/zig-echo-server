@@ -121,7 +121,7 @@ $run=[pscustomobject]@{
     stdout_path=$stdoutPath; stderr_path=$stderrPath
 }
 $modeValid=$RequireOptimizeMode -ceq '' -or $run.optimize_mode -ceq $RequireOptimizeMode
-$correctnessValid=$run.exit_code -eq 0 -and $run.echoed -eq $run.expected_echo_count -and
+$correctnessValid=$run.exit_code -eq 0 -and $run.reported_elapsed_ms -ge 10000 -and $run.echoed -eq $run.expected_echo_count -and
     $run.bytes -eq $run.expected_bytes -and $run.lost -eq 0 -and $run.corrupted -eq 0 -and
     $run.network_errors -eq 0 -and $run.stderr_length -eq 0 -and $run.server_alive_after_run -and $modeValid -and
     [string]::Equals($run.server_sha256,$run.expected_server_sha256,[StringComparison]::OrdinalIgnoreCase)

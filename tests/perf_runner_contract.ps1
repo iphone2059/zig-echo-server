@@ -16,7 +16,7 @@ $tcp = [pscustomobject]@{
     udp_depth=4096; echo_count=17
 }
 $args = @(New-ClientArguments -Case $tcp -Port 7000)
-Assert-True (($args -join '|') -ceq (@('127.0.0.1','/p','tcp','/r','7000','/n','17','/c','8','/threads','2','/k','8','/z','128','/t','30','/cq','4096','/memory','2147483648','/b','0','/q','/stats') -join '|')) 'wrong TCP client arguments'
+Assert-True (($args -join '|') -ceq (@('127.0.0.1','/p','tcp','/r','7000','/n','17','/c','8','/threads','2','/k','8','/z','128','/t','120','/cq','4096','/memory','2147483648','/b','0','/q','/stats') -join '|')) 'wrong TCP client arguments'
 Assert-True (-not ($args -contains '/w')) 'finite TCP client must not have /w'
 $serverArgs = @(New-ServerArguments -Case $tcp -Port 7000)
 Assert-True (($serverArgs -contains '/stats') -and -not ($serverArgs -contains '/w')) 'server arguments must include stats and omit /w'
@@ -38,7 +38,7 @@ $run = [pscustomobject]@{
     exit_code=0; elapsed_ms=10000; echoed=17; expected_echo_count=17; bytes=2176; expected_bytes=2176
     lost=0; corrupted=0; network_errors=0; server_sha256=('a'*64); expected_server_sha256=('a'*64)
     server_path='C:\bench\server.exe'; expected_server_path='C:\bench\server.exe'; server_pid=123
-    server_alive_after_run=$true; stderr_length=0; optimize_mode='ReleaseFast'
+    server_alive_after_run=$true; stderr_length=0; optimize_mode='ReleaseFast'; reported_elapsed_ms=10000
 }
 $stop = [pscustomobject]@{ protocol='tcp'; exit_code=0; stderr_length=0; terminal_line='final protocol=tcp active=0'; worker_count=2; zero_workers=2; server_pid=123 }
 Assert-True (Test-BenchmarkRun -Run $run -StopRecord $stop) 'valid run and clean stop rejected'
@@ -47,7 +47,8 @@ foreach ($mutation in @(
     @{field='bytes';value=2175},@{field='lost';value=1},@{field='corrupted';value=1},
     @{field='network_errors';value=1},@{field='server_sha256';value=('b'*64)},
     @{field='server_path';value='C:\bench\other.exe'},@{field='server_alive_after_run';value=$false},
-    @{field='stderr_length';value=1},@{field='optimize_mode';value='ReleaseSafe'}
+    @{field='stderr_length';value=1},@{field='optimize_mode';value='ReleaseSafe'},
+    @{field='reported_elapsed_ms';value=9999}
 )) {
     $candidate=$run.PSObject.Copy(); $candidate.($mutation.field)=$mutation.value
     Assert-True (-not (Test-BenchmarkRun -Run $candidate -StopRecord $stop)) "invalid run accepted: $($mutation.field)"

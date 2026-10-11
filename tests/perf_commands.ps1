@@ -36,7 +36,7 @@ function New-ClientArguments {
     $arguments=@($HostAddress,'/p',[string]$Case.protocol,'/r',[string]$Port,'/n',[string]$Case.echo_count,
         '/c',[string]$Case.sessions,'/threads',[string]$Case.threads)
     if ($Case.protocol -ceq 'tcp') { $arguments+=@('/k',[string]$Case.pipeline_depth) }
-    $arguments+=@('/z',[string]$Case.payload_bytes,'/t','30','/cq',[string]$Case.cq,
+    $arguments+=@('/z',[string]$Case.payload_bytes,'/t','120','/cq',[string]$Case.cq,
         '/memory',[string]$Case.memory_bytes,'/b',[string]$Case.socket_buffer_bytes,'/q','/stats')
     return [string[]]$arguments
 }
@@ -58,13 +58,17 @@ function Test-BenchmarkRun {
         [string]$RequiredOptimizeMode = 'ReleaseFast')
     $required=@('exit_code','elapsed_ms','echoed','expected_echo_count','bytes','expected_bytes','lost',
         'corrupted','network_errors','server_sha256','expected_server_sha256','server_path',
-        'expected_server_path','server_pid','server_alive_after_run','stderr_length','optimize_mode')
+        'expected_server_path','server_pid','server_alive_after_run','stderr_length','optimize_mode',
+        'reported_elapsed_ms')
     foreach ($field in $required) { if ($null -eq $Run.PSObject.Properties[$field]) { return $false } }
     if ($null -eq $StopRecord) { return $false }
     foreach ($field in @('protocol','exit_code','stderr_length','terminal_line','worker_count','zero_workers','server_pid')) {
         if ($null -eq $StopRecord.PSObject.Properties[$field]) { return $false }
     }
-    if ($Run.exit_code -ne 0 -or $Run.elapsed_ms -lt 10000 -or $Run.echoed -ne $Run.expected_echo_count -or
+    # Both clocks have to agree that the workload ran long enough to mean anything: the wall clock
+    # proves the process lived, the programme's own elapsed proves the load ran.
+    if ($Run.exit_code -ne 0 -or $Run.elapsed_ms -lt 10000 -or $Run.reported_elapsed_ms -lt 10000 -or
+        $Run.echoed -ne $Run.expected_echo_count -or
         $Run.bytes -ne $Run.expected_bytes -or $Run.lost -ne 0 -or $Run.corrupted -ne 0 -or
         $Run.network_errors -ne 0 -or $Run.stderr_length -ne 0 -or -not $Run.server_alive_after_run -or
         $StopRecord.exit_code -ne 0 -or $StopRecord.stderr_length -ne 0 -or
