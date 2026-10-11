@@ -70,7 +70,8 @@ pub fn main(init: std.process.Init) u8 {
     tcp.join(&worker);
     const active = worker.engine_value.activeCount();
     const outstanding = worker.engine_value.outstanding();
-    const pending_handoffs = credits[0].pending;
+    // Every credit has to be home: a missing one means a published handoff was never retired.
+    const pending_handoffs: u32 = if (credits[0].isFull()) 0 else 1;
     tcp.destroy(&worker);
 
     var output_buffer: [192]u8 = undefined;

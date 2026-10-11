@@ -432,7 +432,7 @@ pub const worker = struct {
             operation.socket = c.INVALID_SOCKET;
             const socket_value = owner.get();
             const index = wrk.engine_value.takeSlot() orelse {
-                wrk.credits.?.cancel();
+                wrk.credits.?.release();
                 owner.deinit();
                 acknowledge(operation);
                 return;
@@ -451,7 +451,7 @@ pub const worker = struct {
             if (rq == c.RIO_INVALID_RQ) {
                 native.diagnostics.report("RIOCreateRequestQueue(TCP)", @bitCast(c.WSAGetLastError()));
                 wrk.engine_value.returnSlot(index);
-                wrk.credits.?.cancel();
+                wrk.credits.?.release();
                 closeSocket(wrk, index);
                 acknowledge(operation);
                 return;
@@ -459,12 +459,13 @@ pub const worker = struct {
             wrk.request_queues[index] = rq;
             const admit_step = wrk.engine_value.admit(index, native.nowMilliseconds()) orelse {
                 wrk.engine_value.returnSlot(index);
-                wrk.credits.?.cancel();
+                wrk.credits.?.release();
                 closeSocket(wrk, index);
                 acknowledge(operation);
                 return;
             };
-            wrk.credits.?.commit();
+            // Adoption consumes the reservation the acceptor already took; the credit comes back
+            // only when this connection is released.
             maybeArm(wrk);
             executeAll(wrk, &[_]engine.Step{admit_step});
             acknowledge(operation);
@@ -654,44 +655,50 @@ pub const worker = struct {
 /// connection is released, so the acceptor never publishes more sockets than the worker can hold --
 /// including the ones that are still in transit through the completion port.
 pub const acceptor = struct {
+    /// The shared admission accounting.
+    ///
+    /// Exactly one counter crosses the thread boundary: the acceptor reserves while it selects a
+    /// worker, and a worker gives the credit back from its own thread when the connection ends or a
+    /// handoff is withdrawn. A plain integer here would be a data race that surfaces as an
+    /// over-admitted worker or a lost credit, neither of which the completion counters would show.
+    ///
+    /// The counter holds the credits that are still free. A reservation is consumed the moment the
+    /// socket is handed over and only returned when the connection is released, so the acceptor can
+    /// never overbook a worker -- including with sockets still in transit through the completion port.
     pub const AdmissionCredits = struct {
+        available: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// Immutable for the whole run; only the atomic counter moves.
         capacity: u32 = 0,
-        active: u32 = 0,
-        pending: u32 = 0,
 
         pub fn init(capacity: u32) AdmissionCredits {
-            return .{ .capacity = capacity };
+            return .{ .available = std.atomic.Value(u32).init(capacity), .capacity = capacity };
         }
 
-        pub fn available(self: *const AdmissionCredits) u32 {
-            const used = self.active + self.pending;
-            return if (used >= self.capacity) 0 else self.capacity - used;
+        /// Takes one credit if any is left. The compare-exchange loop is what makes the reservation
+        /// exact against a release happening on a worker thread at the same moment.
+        pub fn tryReserve(self: *AdmissionCredits) bool {
+            var observed = self.available.load(.acquire);
+            while (true) {
+                if (observed == 0) return false;
+                if (self.available.cmpxchgWeak(observed, observed - 1, .acquire, .monotonic)) |actual| {
+                    observed = actual;
+                } else return true;
+            }
         }
 
-        /// Takes a credit for a socket that is about to be handed to this worker.
-        pub fn reserve(self: *AdmissionCredits) bool {
-            if (self.available() == 0) return false;
-            self.pending += 1;
-            return true;
-        }
-
-        /// The worker adopted the socket: the in-transit credit becomes an active one.
-        pub fn commit(self: *AdmissionCredits) void {
-            if (self.pending == 0) return;
-            self.pending -= 1;
-            self.active += 1;
-        }
-
-        /// The handoff was withdrawn before the worker adopted it.
-        pub fn cancel(self: *AdmissionCredits) void {
-            if (self.pending == 0) return;
-            self.pending -= 1;
-        }
-
-        /// The connection ended and its slot is reusable.
+        /// Returns one credit. Returning more than the capacity means the accounting lost a credit,
+        /// which is an internal invariant failure rather than a counter to clamp.
         pub fn release(self: *AdmissionCredits) void {
-            if (self.active == 0) return;
-            self.active -= 1;
+            const previous = self.available.fetchAdd(1, .release);
+            if (previous >= self.capacity) {
+                native.diagnostics.failFast("worker admission credit", c.ERROR_INVALID_STATE);
+            }
+        }
+
+        /// True when every credit has been returned, which is the terminal condition the shutdown
+        /// barrier waits for.
+        pub fn isFull(self: *const AdmissionCredits) bool {
+            return self.available.load(.acquire) == self.capacity;
         }
     };
 
@@ -725,7 +732,9 @@ pub const acceptor = struct {
         var step: u32 = 0;
         while (step < worker_count) : (step += 1) {
             const index = (rotation.* + step) % worker_count;
-            if (credits[index].available() != 0) {
+            // The reservation happens here, so a returned worker is already charged for the socket
+            // the acceptor is about to publish.
+            if (credits[index].tryReserve()) {
                 rotation.* = (index + 1) % worker_count;
                 return index;
             }
@@ -994,7 +1003,6 @@ pub const acceptor = struct {
             deferRetry(self);
             return;
         };
-        _ = self.credits[worker_index].reserve();
         if (!transition(operation, .posted, .transit)) failFast("accept transit state", c.ERROR_INVALID_STATE);
         worker.tcp.postHandoff(&self.workers[worker_index], operation);
     }

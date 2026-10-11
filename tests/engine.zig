@@ -111,25 +111,24 @@ test "timeouts close and the drain releases the slot" {
     try std.testing.expect(engine_value.mayExit());
 }
 
-test "the admission credits cover in-transit connections" {
+test "an admission credit covers a connection that is still in transit" {
     var credit = acceptor.AdmissionCredits.init(3);
-    try std.testing.expectEqual(@as(u32, 3), credit.available());
-    try std.testing.expect(credit.reserve());
-    // A reserved but not yet adopted connection still occupies capacity: the socket is in flight
-    // through the completion port and the worker has not seen it yet.
-    try std.testing.expectEqual(@as(u32, 2), credit.available());
-    try std.testing.expect(credit.reserve());
-    try std.testing.expect(credit.reserve());
-    try std.testing.expect(!credit.reserve());
-    credit.commit();
-    try std.testing.expectEqual(@as(u32, 1), credit.active);
-    try std.testing.expectEqual(@as(u32, 2), credit.pending);
-    credit.cancel();
-    try std.testing.expectEqual(@as(u32, 1), credit.pending);
+    try std.testing.expectEqual(@as(u32, 3), credit.capacity);
+    try std.testing.expect(credit.isFull());
+    try std.testing.expect(credit.tryReserve());
+    try std.testing.expect(credit.tryReserve());
+    try std.testing.expect(credit.tryReserve());
+    // Three connections are in flight through the completion port, so there is no credit left even
+    // though no worker has adopted a socket yet.
+    try std.testing.expect(!credit.tryReserve());
+    try std.testing.expect(!credit.isFull());
+    // Adoption consumes the reservation; only releasing the connection returns the credit.
     credit.release();
-    try std.testing.expectEqual(@as(u32, 0), credit.active);
-    // One credit is still committed to an in-transit connection, so two remain available.
-    try std.testing.expectEqual(@as(u32, 2), credit.available());
+    try std.testing.expect(credit.tryReserve());
+    credit.release();
+    credit.release();
+    credit.release();
+    try std.testing.expect(credit.isFull());
 }
 
 test "worker selection skips a saturated worker and rotates" {
@@ -139,18 +138,15 @@ test "worker selection skips a saturated worker and rotates" {
         acceptor.AdmissionCredits.init(1),
     };
     var rotation: u32 = 0;
-    _ = credits[1].reserve();
+    // Saturation is expressed by taking the credit away before the selection runs.
+    try std.testing.expect(credits[1].tryReserve());
     try std.testing.expectEqual(@as(?u32, 0), acceptor.selectWorker(&credits, &rotation, 3));
-    // The saturated worker is skipped and the rotation continues past it.
     try std.testing.expectEqual(@as(?u32, 2), acceptor.selectWorker(&credits, &rotation, 3));
-    try std.testing.expectEqual(@as(?u32, 0), acceptor.selectWorker(&credits, &rotation, 3));
-    _ = credits[0].reserve();
-    _ = credits[2].reserve();
+    // The two selections already spent the credits of workers 0 and 2.
     try std.testing.expect(acceptor.selectWorker(&credits, &rotation, 3) == null);
-    // Withdrawing the reservation frees the worker again; releasing would only have given back an
-    // active credit it never adopted.
-    credits[1].cancel();
+    credits[1].release();
     try std.testing.expectEqual(@as(?u32, 1), acceptor.selectWorker(&credits, &rotation, 3));
+    try std.testing.expect(acceptor.selectWorker(&credits, &rotation, 3) == null);
     try std.testing.expect(acceptor.selectWorker(&credits, &rotation, 0) == null);
 }
 
@@ -368,4 +364,64 @@ test "the terminal line keeps the reference field order for both protocols" {
     );
     const udp_line = statistics.writeFinalLine(.udp, 250, 1, 4, &buffer).?;
     try std.testing.expect(std.mem.startsWith(u8, udp_line, "final protocol=udp elapsed_ms=250 workers=1 accepted=2 active=0 outstanding=4 "));
+}
+
+
+/// Reserves and immediately returns, which is the tightest possible contention on the one counter
+/// the acceptor and the workers share.
+fn creditChurn(credits: *acceptor.AdmissionCredits, iterations: u32, acquired: *u32) void {
+    var taken: u32 = 0;
+    var index: u32 = 0;
+    while (index < iterations) : (index += 1) {
+        if (credits.tryReserve()) {
+            taken += 1;
+            credits.release();
+        }
+    }
+    acquired.* = taken;
+}
+
+/// Holds a batch the way in-flight handoffs do, then retires it together, so the compare-exchange
+/// loop has to interleave with releases from the other threads.
+fn creditHandoffChurn(credits: *acceptor.AdmissionCredits, attempts: u32, acquired: *u32) void {
+    var held: u32 = 0;
+    var index: u32 = 0;
+    while (index < attempts) : (index += 1) {
+        if (credits.tryReserve()) held += 1 else std.Thread.yield() catch {};
+    }
+    acquired.* = held;
+    while (held != 0) : (held -= 1) credits.release();
+}
+
+test "admission credits stay exact under concurrent reserve and release" {
+    // Four threads hammer one counter the way the acceptor and the workers do, and every thread
+    // returns what it took. A non-atomic counter drifts here: it either loses credits, so the
+    // final count falls short of the capacity, or it over-releases and trips the guard.
+    var credits = acceptor.AdmissionCredits.init(8);
+    var acquired: [4]u32 = @splat(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &acquired) |*thread, *count| {
+        thread.* = try std.Thread.spawn(.{}, creditChurn, .{ &credits, 50_000, count });
+    }
+    for (&threads) |*thread| thread.join();
+    try std.testing.expect(credits.isFull());
+    var total: u64 = 0;
+    for (acquired) |count| total += count;
+    try std.testing.expect(total != 0);
+}
+
+test "admission credits survive concurrent handoff bursts and retirements" {
+    // Every thread takes what it can and retires the whole batch afterwards, which is the shape of
+    // an acceptor publishing handoffs while the workers finish connections.
+    var credits = acceptor.AdmissionCredits.init(16);
+    var acquired: [4]u32 = @splat(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &acquired) |*thread, *count| {
+        thread.* = try std.Thread.spawn(.{}, creditHandoffChurn, .{ &credits, 20_000, count });
+    }
+    for (&threads) |*thread| thread.join();
+    try std.testing.expect(credits.isFull());
+    var total: u64 = 0;
+    for (acquired) |count| total += count;
+    try std.testing.expect(total != 0);
 }

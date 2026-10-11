@@ -132,8 +132,8 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     if (acceptor_published) acceptor.stop(&acceptor_value);
     acceptor.destroy(&acceptor_value);
     if (acceptor_value.liveCount() != 0) return reportAndFail("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
-    for (credits) |credit| {
-        if (credit.pending != 0) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
+    for (credits) |*credit| {
+        if (!credit.isFull()) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
     }
     if (!shutdown.advance(.acceptor_stopped)) return reportAndFail("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
