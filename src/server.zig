@@ -57,6 +57,15 @@ pub fn slotCapacity(options: *const types.Options, worker_count: u32, worker_ind
     return contract.tcpConnectionCapacity(options.cq_capacity, budget / options.rio_buffer_bytes);
 }
 
+/// The coordinator's worker ownership guard. After every thread is joined, a worker that did not
+/// retire its operations still has registered memory and OVERLAPPED records Windows can reach, so
+/// releasing it would be a use-after-free rather than a recoverable shutdown error.
+pub fn requireWorkerRelease(running: bool, drained: bool) void {
+    if (running and !drained) {
+        native.diagnostics.failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
+    }
+}
+
 fn reportAndFail(stage: []const u8, native_error: u32) types.ExitCode {
     native.diagnostics.report(stage, native_error);
     return .network;
@@ -85,6 +94,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
 
     var failed = std.atomic.Value(bool).init(false);
     var initialized: u32 = 0;
+    var started_workers: u32 = 0;
     for (workers, 0..) |*wrk, position| {
         tcp.initialize(
             wrk,
@@ -98,11 +108,15 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
             failed.store(true, .release);
             break;
         };
+        // Two different counts: initialized is the cleanup scope -- workers whose storage exists and
+        // must be released -- while started_workers is the threads that actually run, which is what the
+        // reference reports.
         initialized += 1;
         if (!tcp.start(wrk)) {
             failed.store(true, .release);
             break;
         }
+        started_workers += 1;
     }
 
     var acceptor_value: acceptor.Acceptor = .{};
@@ -150,26 +164,18 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     statistics.rejected +%= acceptor_value.core.rejected;
     statistics.network_errors +%= acceptor_value.core.network_errors +% startup_network_errors;
     var fatal = failed.load(.acquire);
-    var undrained_worker = false;
     for (workers[0..initialized]) |*wrk| {
         const running = wrk.thread.value != null;
         tcp.join(wrk);
         // Every thread is stopped now, so the worker's own accounting is quiescent and may be read.
-        if (running and !wrk.engine_value.mayExit()) undrained_worker = true;
+        requireWorkerRelease(running, wrk.engine_value.mayExit());
         statistics.merge(&wrk.engine_value.statistics);
         if (wrk.engine_value.fatal) fatal = true;
     }
     if (!shutdown.advance(.joined)) native.diagnostics.failFast("TCP shutdown join order", c.ERROR_INVALID_STATE);
 
-    // Phase two: the ownership invariants, read while nothing is running. A live accept slot, or a
-    // worker that never retired its operations, means Windows can still reach registered memory and
-    // OVERLAPPED records, so releasing them would be a use-after-free. That is a fail-fast, not a
-    // recoverable error that the deferred cleanup could safely carry on from.
-    if (acceptor_value.terminalLive() != 0) {
-        native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
-    }
-    if (undrained_worker) native.diagnostics.failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
-
+    // The acceptor proves its own ownership at its release boundary, and the worker guard above has
+    // already run for every joined thread, so nothing below can free memory Windows can still reach.
     // Phase three: release, then assert the accounting that no longer implies native ownership.
     for (workers[0..initialized]) |*wrk| tcp.destroy(wrk);
     for (credits) |*credit| {
@@ -179,7 +185,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     const outstanding: u32 = 0;
     if (options.stats) {
         var buffer: [512]u8 = undefined;
-        const line = statistics.writeFinalLine(.tcp, native.nowMilliseconds() - start, initialized, outstanding, &buffer) orelse
+        const line = statistics.writeFinalLine(.tcp, native.nowMilliseconds() - start, started_workers, outstanding, &buffer) orelse
             return reportAndFail("format TCP statistics", c.ERROR_INSUFFICIENT_BUFFER);
         if (!native.diagnostics.writeStdout(line)) return reportAndFail("write TCP statistics", c.GetLastError());
     }

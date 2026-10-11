@@ -849,9 +849,6 @@ pub const acceptor = struct {
         states: []State = &.{},
         /// The pure accept state machine: transitions, rotation and the admission tallies.
         core: Core = .{},
-        /// The slots still live when the acceptor thread returned, recorded before the state storage
-        /// is released so the shutdown barrier can assert the terminal condition afterwards.
-        terminal_live: u32 = 0,
         ready: bool = false,
         startup_ok: bool = false,
 
@@ -867,12 +864,6 @@ pub const acceptor = struct {
         /// before it can release its listener and its accept table.
         pub fn liveCount(self: *const Acceptor) u32 {
             return self.core.liveCount();
-        }
-
-        /// Reads the terminal count recorded by destroy. The state storage is gone by then, so this
-        /// is the only way to assert that no accept slot was left behind.
-        pub fn terminalLive(self: *const Acceptor) u32 {
-            return self.terminal_live;
         }
 
         pub fn postedCount(self: *const Acceptor) u32 {
@@ -1213,13 +1204,21 @@ pub const acceptor = struct {
 
     /// Releases the accept table, the listener, the event and the port. Every published handoff has
     /// already been acknowledged and every posted accept retired, so nothing is left in flight.
+    /// Stops the acceptor, waits for its thread, proves that Windows no longer owns any accept slot,
+    /// and only then releases the table and the state.
+    ///
+    /// The proof has to live here rather than at the caller. A live slot means a posted AcceptEx or a
+    /// published handoff was never retired, so the listener and the registered address records can
+    /// still be referenced; freeing them would be a use-after-free. Failing fast at the release
+    /// boundary is what makes that unreachable from the coordinator, from an initialisation error and
+    /// from a test driver alike.
     pub fn destroy(self: *Acceptor) void {
         const allocator = std.heap.page_allocator;
         join(self);
         self.thread.deinit();
-        // Recorded while the storage is still valid. A live slot here means a posted accept or a
-        // published handoff was never retired, which the caller reports rather than crashing on.
-        self.terminal_live = if (self.ready) self.liveCount() else 0;
+        if (self.core.liveCount() != 0) {
+            native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
+        }
         for (self.operations) |*operation| closeAccepted(operation);
         if (self.operations.len != 0) allocator.free(self.operations);
         self.operations = &.{};

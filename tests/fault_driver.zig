@@ -7,6 +7,7 @@
 const std = @import("std");
 const server = @import("server");
 const c = server.native.sdk.c;
+const acceptor = server.internal.acceptor;
 
 pub fn main(init: std.process.Init) u8 {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return 4;
@@ -23,6 +24,24 @@ pub fn main(init: std.process.Init) u8 {
     }
     if (std.mem.eql(u8, mode, "control_post_failure")) {
         server.native.guards.requireControlPost(c.FALSE, 5, "PostQueuedCompletionStatus(worker stop)");
+    }
+    if (std.mem.eql(u8, mode, "worker_undrained")) {
+        // The coordinator's own guard, with the state it sees when a joined worker never retired its
+        // operations.
+        server.server.requireWorkerRelease(true, false);
+    }
+    if (std.mem.eql(u8, mode, "acceptor_ownership")) {
+        // A real destroy() on an acceptor whose core still claims Windows owns an accept slot. There is
+        // deliberately no native I/O here: the point is that the release boundary refuses to free the
+        // table and the address records while that claim stands, so the process must die before the
+        // free rather than after it.
+        var states: [1]acceptor.State = undefined;
+        var value: acceptor.Acceptor = .{};
+        value.states = &states;
+        value.core = acceptor.Core.init(&states);
+        _ = value.core.transition(0, .idle, .posted);
+        value.ready = true;
+        acceptor.destroy(&value);
     }
     return 1;
 }
