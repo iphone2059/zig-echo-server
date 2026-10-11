@@ -867,6 +867,24 @@ pub const acceptor = struct {
             return .{ .handoff = .{ .index = index, .worker = candidate } };
         }
 
+        /// A worker acknowledged a handoff, or a deferred slot's queued repost is being retired.
+        ///
+        /// This is the reference's on_ack. Whatever socket is left in the slot belongs to the
+        /// acceptor again, so the slot returns to idle and the caller is told whether to post again.
+        pub fn onAck(self: *Core, index: u32) AcceptAction {
+            const current = self.state(index) orelse
+                return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
+            // An acknowledgement without a handoff, or for a slot that is neither in transit nor
+            // deferred, means the port delivered control this acceptor does not own.
+            if (current != .transit and current != .deferred) {
+                return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
+            }
+            self.states[index] = .idle;
+            // A stopping acceptor retires the slot without arming another post.
+            if (self.stopping) return .none;
+            return .{ .repost = index };
+        }
+
         /// Starts the credit scan at the candidate the rotation chose and takes the first worker that
         /// still has a credit. The candidate is a hint rather than a promise: a saturated worker is
         /// skipped instead of being handed a socket it would have to refuse.
@@ -1004,12 +1022,18 @@ pub const acceptor = struct {
         return true;
     }
 
-    /// Retires one control packet. A slot that a worker acknowledged or that deferred its repost
-    /// returns to idle and is posted again unless the acceptor is stopping.
-    fn resumeSlot(self: *Acceptor, operation: *Operation, expected: State) void {
-        if (!self.core.transition(operation.index, expected, .idle)) failFast("accept control state", c.ERROR_INVALID_STATE);
-        if (!self.core.stopping and !postAccept(self, operation)) {
-            failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
+    /// Executes the acknowledgement the core decided. The transition and the repost-or-retire choice
+    /// are the core's; this only carries them out.
+    fn resumeSlot(self: *Acceptor, operation: *Operation) void {
+        switch (self.core.onAck(operation.index)) {
+            .none => {},
+            .fail => failFast("accept acknowledgement state", c.ERROR_INVALID_DATA),
+            .repost => {
+                if (!postAccept(self, operation)) {
+                    failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
+                }
+            },
+            .handoff => failFast("accept acknowledgement action", c.ERROR_INVALID_DATA),
         }
     }
 
@@ -1140,8 +1164,7 @@ pub const acceptor = struct {
                 const operation: *Operation = @ptrFromInt(packet.key);
                 if (!operationInRange(self, operation)) failFast("accept control identity", c.ERROR_INVALID_DATA);
                 switch (self.core.state(operation.index) orelse .idle) {
-                    .transit => resumeSlot(self, operation, .transit),
-                    .deferred => resumeSlot(self, operation, .deferred),
+                    .transit, .deferred => resumeSlot(self, operation),
                     else => failFast("accept control state", c.ERROR_INVALID_DATA),
                 }
                 continue;

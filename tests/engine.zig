@@ -575,3 +575,30 @@ test "a connection reset returns the slot to receiving without counting a send" 
     try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sent_bytes);
     try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.receives);
 }
+test "an acknowledgement decides the next step and refuses an unowned one" {
+    // Mirrors a_completion_for_an_unposted_slot_is_an_invariant_violation's acknowledgement half and
+    // an_aborted_handoff_returns_the_slot_and_clears_the_live_count: an ack without a handoff is
+    // refused, a real one reposts, and a stopping acceptor retires the slot instead.
+    var states: [2]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    core.worker_count = 1;
+
+    // Nothing was handed off to this slot, so the acknowledgement is not this acceptor's.
+    const unowned = core.onAck(1);
+    try std.testing.expectEqual(@as(u32, 1), unowned.fail.index);
+    try std.testing.expectEqual(types.error_invalid_data, unowned.fail.code);
+
+    // A handoff in transit is acknowledged and the slot is posted again.
+    _ = core.transition(0, .idle, .posted);
+    _ = core.onCompletion(0, true, 0);
+    try std.testing.expectEqual(acceptor.State.transit, core.state(0).?);
+    try std.testing.expectEqual(@as(u32, 0), core.onAck(0).repost);
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+
+    // A deferred slot is retired the same way, and under stop nothing is posted again.
+    try std.testing.expect(core.transition(0, .idle, .deferred));
+    try std.testing.expectEqual(@as(u32, 1), core.liveCount());
+    core.stop();
+    try std.testing.expectEqual(acceptor.AcceptAction.none, core.onAck(0));
+    try std.testing.expectEqual(@as(u32, 0), core.liveCount());
+}
