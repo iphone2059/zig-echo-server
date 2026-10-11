@@ -63,6 +63,11 @@ function Invoke-PinnedZig {
 }
 
 Invoke-PinnedZig -Arguments @('build', '-Dtarget=x86_64-windows-msvc', "-Doptimize=$Optimize")
+# Both modes install to the same zig-out\bin, so the mode is frozen beside the binary the moment it
+# is built. A benchmark that reads the path instead of this marker cannot tell Debug from ReleaseFast.
+$markerDirectory = Join-Path $PSScriptRoot 'zig-out\bin'
+New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
+Set-Content -LiteralPath (Join-Path $markerDirectory 'optimize-mode.txt') -Value $Optimize -Encoding ascii
 if (-not $BuildOnly) {
     Invoke-PinnedZig -Arguments @('build', 'test', '-Dtarget=x86_64-windows-msvc', "-Doptimize=$Optimize")
 }

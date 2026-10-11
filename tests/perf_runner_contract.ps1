@@ -38,7 +38,7 @@ $run = [pscustomobject]@{
     exit_code=0; elapsed_ms=10000; echoed=17; expected_echo_count=17; bytes=2176; expected_bytes=2176
     lost=0; corrupted=0; network_errors=0; server_sha256=('a'*64); expected_server_sha256=('a'*64)
     server_path='C:\bench\server.exe'; expected_server_path='C:\bench\server.exe'; server_pid=123
-    server_alive_after_run=$true; stderr_length=0
+    server_alive_after_run=$true; stderr_length=0; optimize_mode='ReleaseFast'
 }
 $stop = [pscustomobject]@{ protocol='tcp'; exit_code=0; stderr_length=0; terminal_line='final protocol=tcp active=0'; worker_count=2; zero_workers=2; server_pid=123 }
 Assert-True (Test-BenchmarkRun -Run $run -StopRecord $stop) 'valid run and clean stop rejected'
@@ -47,7 +47,7 @@ foreach ($mutation in @(
     @{field='bytes';value=2175},@{field='lost';value=1},@{field='corrupted';value=1},
     @{field='network_errors';value=1},@{field='server_sha256';value=('b'*64)},
     @{field='server_path';value='C:\bench\other.exe'},@{field='server_alive_after_run';value=$false},
-    @{field='stderr_length';value=1}
+    @{field='stderr_length';value=1},@{field='optimize_mode';value='ReleaseSafe'}
 )) {
     $candidate=$run.PSObject.Copy(); $candidate.($mutation.field)=$mutation.value
     Assert-True (-not (Test-BenchmarkRun -Run $candidate -StopRecord $stop)) "invalid run accepted: $($mutation.field)"
@@ -72,4 +72,25 @@ $described=& $runner -ServerPath 'missing-server.exe' -ServerPid 0 -ServerArgume
     -ClientPath 'missing-client.exe' -Port 7000 -Case 'tcp_128_k1' -OutputDirectory $output -Label 'dry-run' -DescribeOnly
 Assert-True (($described.client_arguments -contains '/n') -and -not ($described.client_arguments -contains '/w')) 'describe-only client command invalid'
 Assert-True (-not (Test-Path -LiteralPath $output)) 'describe-only created output directory'
+
+$modeFixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('perf-mode-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $modeFixtureDirectory
+$modeFixtureExe = Join-Path $modeFixtureDirectory 'frozen.exe'
+$modeMarker = Join-Path $modeFixtureDirectory 'optimize-mode.txt'
+try {
+    $missingModeRejected = $false
+    try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $missingModeRejected = $true }
+    Assert-True $missingModeRejected 'missing optimize mode marker was accepted'
+    Assert-True ($null -eq (Get-ExecutableOptimizeMode -Path $modeFixtureExe -AllowUnknown)) 'unknown peer mode was invented'
+    Set-Content -LiteralPath $modeMarker -Value 'ReleaseFast' -Encoding ascii
+    Assert-True ((Get-ExecutableOptimizeMode -Path $modeFixtureExe) -ceq 'ReleaseFast') 'frozen ReleaseFast marker was ignored'
+    Set-Content -LiteralPath $modeMarker -Value 'ReleaseSafe' -Encoding ascii
+    $unknownModeRejected = $false
+    try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $unknownModeRejected = $true }
+    Assert-True $unknownModeRejected 'unknown optimize mode was accepted'
+} finally {
+    if (Test-Path -LiteralPath $modeMarker) { Remove-Item -LiteralPath $modeMarker }
+    Remove-Item -LiteralPath $modeFixtureDirectory
+}
+
 Write-Output 'server performance runner contract passed'

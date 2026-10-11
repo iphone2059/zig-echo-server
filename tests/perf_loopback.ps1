@@ -36,6 +36,8 @@ $serverExe=(Resolve-Path -LiteralPath $ServerPath -ErrorAction Stop).Path
 $clientExe=(Resolve-Path -LiteralPath $ClientPath -ErrorAction Stop).Path
 $serverCommit=Get-ExecutableCommit -Path $serverExe
 $clientCommit=Get-ExecutableCommit -Path $clientExe
+$serverOptimizeMode=Get-ExecutableOptimizeMode -Path $serverExe
+$clientOptimizeMode=Get-ExecutableOptimizeMode -Path $clientExe -AllowUnknown
 $serverProcess=Get-Process -Id $ServerPid -ErrorAction Stop
 try {
     if (-not [string]::Equals([IO.Path]::GetFullPath($serverProcess.Path),[IO.Path]::GetFullPath($serverExe),[StringComparison]::OrdinalIgnoreCase)) {
@@ -104,6 +106,7 @@ $run=[pscustomobject]@{
     client_sha256=(Get-FileHash -LiteralPath $clientExe -Algorithm SHA256).Hash.ToLowerInvariant()
     server_path=$serverExe; expected_server_path=$serverExe; client_path=$clientExe; server_pid=$ServerPid
     server_commit=$serverCommit; client_commit=$clientCommit
+    optimize_mode=$serverOptimizeMode; client_optimize_mode=$clientOptimizeMode
     server_arguments=$ServerArguments; client_arguments=$clientArguments; host_address=$HostAddress
     zig_version=(& 'C:\bin\zig-x86_64-windows-0.17.0-dev.2375+d8aab4878\zig.exe' version | Out-String).Trim()
     windows_version=[Environment]::OSVersion.VersionString

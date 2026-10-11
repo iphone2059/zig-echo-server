@@ -56,7 +56,7 @@ function Test-BenchmarkRun {
     param([Parameter(Mandatory=$true)][pscustomobject]$Run, [AllowNull()][pscustomobject]$StopRecord)
     $required=@('exit_code','elapsed_ms','echoed','expected_echo_count','bytes','expected_bytes','lost',
         'corrupted','network_errors','server_sha256','expected_server_sha256','server_path',
-        'expected_server_path','server_pid','server_alive_after_run','stderr_length')
+        'expected_server_path','server_pid','server_alive_after_run','stderr_length','optimize_mode')
     foreach ($field in $required) { if ($null -eq $Run.PSObject.Properties[$field]) { return $false } }
     if ($null -eq $StopRecord) { return $false }
     foreach ($field in @('protocol','exit_code','stderr_length','terminal_line','worker_count','zero_workers','server_pid')) {
@@ -69,6 +69,7 @@ function Test-BenchmarkRun {
         $StopRecord.server_pid -ne $Run.server_pid -or
         -not [string]::Equals($Run.server_sha256,$Run.expected_server_sha256,[StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals([IO.Path]::GetFullPath($Run.server_path),[IO.Path]::GetFullPath($Run.expected_server_path),[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($Run.optimize_mode -cnotin @('Debug', 'ReleaseFast')) { return $false }
     if ($StopRecord.protocol -ceq 'tcp') {
         return $StopRecord.terminal_line -match '^final protocol=tcp\b.*\bactive=0\b' -and
             $StopRecord.worker_count -gt 0 -and $StopRecord.worker_count -eq $StopRecord.zero_workers
@@ -77,6 +78,22 @@ function Test-BenchmarkRun {
         return $StopRecord.terminal_line -match '^final protocol=udp\b.*\boutstanding=0\b'
     }
     return $false
+}
+
+function Get-ExecutableOptimizeMode {
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnknown)
+
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $marker = Join-Path $directory 'optimize-mode.txt'
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        if ($AllowUnknown) { return $null }
+        throw "executable optimize mode marker missing: $marker"
+    }
+    $mode = (Get-Content -LiteralPath $marker -Raw).Trim()
+    # An unknown mode is rejected rather than carried into a result. Both build modes install to the
+    # same zig-out\bin, so a benchmark that cannot say which build it measured is not a measurement.
+    if ($mode -cnotin @('Debug', 'ReleaseFast')) { throw "invalid executable optimize mode marker: $marker" }
+    return $mode
 }
 
 function Get-ExecutableCommit {
