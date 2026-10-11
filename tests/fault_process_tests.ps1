@@ -47,6 +47,16 @@ try {
     if ($acceptorStderr -notmatch 'TCP acceptor terminal operations failed: native_error=996') {
         throw "acceptor ownership boundary lost its identity: $acceptorStderr"
     }
+    # The positive control for the startup case: a worker that never produced a thread must pass the
+    # same guard that a joined, undrained worker fails. Without this the fail-fast above could be
+    # satisfied by a guard that rejects every input.
+    $notStartedStdout = Join-Path $scratch 'worker_not_started.stdout.txt'
+    $notStartedStderr = Join-Path $scratch 'worker_not_started.stderr.txt'
+    $notStartedExit = Invoke-Fault -Mode 'worker_not_started' -Stdout $notStartedStdout -Stderr $notStartedStderr
+    if ($notStartedExit -ne 0) { throw "worker_not_started exited $notStartedExit, expected 0." }
+    $notStartedError = Get-Content -Raw -LiteralPath $notStartedStderr
+    if ($notStartedError.Length -ne 0) { throw "worker_not_started wrote stderr: $notStartedError" }
+
     Write-Host 'fault_process_tests: PASS'
 }
 finally {

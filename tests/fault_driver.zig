@@ -25,6 +25,14 @@ pub fn main(init: std.process.Init) u8 {
     if (std.mem.eql(u8, mode, "control_post_failure")) {
         server.native.guards.requireControlPost(c.FALSE, 5, "PostQueuedCompletionStatus(worker stop)");
     }
+    if (std.mem.eql(u8, mode, "worker_not_started")) {
+        // The other half of a partially failed startup: a worker whose tcp.start never produced a
+        // thread. Its storage still exists and is released by the cleanup scope, but it must not be
+        // reported as an undrained worker -- there is no thread that could have failed to drain.
+        // Returning from the guard at all is the assertion, so this boundary exits successfully.
+        server.server.requireWorkerRelease(false, false);
+        return 0;
+    }
     if (std.mem.eql(u8, mode, "worker_undrained")) {
         // The coordinator's own guard, with the state it sees when a joined worker never retired its
         // operations.
