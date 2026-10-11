@@ -299,6 +299,18 @@ pub const worker = struct {
             native.diagnostics.failFast(stage, native_error);
         }
 
+        /// Whether a handoff that reached this worker has to be withdrawn instead of adopted.
+        ///
+        /// Only the worker's own stop withdraws it: beginStop closes admission and closes the sockets
+        /// it is already serving, so a socket arriving after that point cannot be adopted and may in
+        /// fact already be closed. The handoff is acknowledged so the acceptor recycles the slot, and
+        /// nothing is reported, because a stop is not a network fault. A worker that has merely
+        /// reached the admission barrier is still running and still adopts, so testing that flag here
+        /// would turn a genuine request-queue failure into a silent withdrawal.
+        pub fn withdrawsHandoff(stopping: bool) bool {
+            return stopping;
+        }
+
         fn closeSocket(wrk: *Worker, index: u32) void {
             if (index < wrk.connection_sockets.len) wrk.connection_sockets[index].deinit();
             if (index < wrk.request_queues.len) wrk.request_queues[index] = c.RIO_INVALID_RQ;
@@ -428,6 +440,18 @@ pub const worker = struct {
         /// the socket, returns its credit and acknowledges the handoff so the acceptor can recycle
         /// the operation instead of waiting forever.
         pub fn takeSocket(wrk: *Worker, operation: *acceptor.Operation) void {
+            if (withdrawsHandoff(wrk.engine_value.stopping)) {
+                // The socket is withdrawn before it is taken, which is the order the reference uses:
+                // a stopping worker has already closed admission, so the accepted socket may have
+                // been closed under this handoff and must not be handed to RIOCreateRequestQueue.
+                // Reporting that close as a failure would turn an ordinary shutdown into a network
+                // fault, which is exactly what this guard prevents.
+                wrk.credits.?.release();
+                operation.socket_owner.deinit();
+                operation.socket = c.INVALID_SOCKET;
+                acknowledge(operation);
+                return;
+            }
             var owner = native.socket.Socket{ .value = operation.socket_owner.take() };
             operation.socket = c.INVALID_SOCKET;
             const socket_value = owner.get();
@@ -735,6 +759,41 @@ pub const acceptor = struct {
     /// decision a completion produces; that one is AcceptAction above.
     pub const SlotDisposition = enum(u8) { none, close_posted, wait_ack };
 
+    /// Whether a failed AcceptEx completion is a fault of this run rather than a consequence of
+    /// shutting it down.
+    ///
+    /// The acceptor is the only member that closes an accept slot, and it closes them from beginStop,
+    /// so under stopping this failure is the cancellation the stop itself requested. A run whose
+    /// global failure flag is already set is failing for a reason that was reported when it was set,
+    /// so it accumulates no further ledger entries either. Both references test exactly these two
+    /// conditions before counting, while the acceptor loop unposts on the same flag, so a real
+    /// connection-level fault during healthy admission is still counted.
+    pub fn acceptorCountsFailure(stopping: bool, failed: bool) bool {
+        return !stopping and !failed;
+    }
+
+    /// What the handoff path does when a successful AcceptEx completion is taken off the port.
+    pub const Disposition = enum(u8) {
+        /// The stop owns this slot's socket: retire the slot instead of configuring a closed socket.
+        withdraw,
+        /// A live admission path lost its socket or listener, so the invariant no longer holds.
+        fatal,
+        /// Admission is still healthy and both handles are usable.
+        handoff,
+    };
+
+    /// Decides the handoff guard purely, without a listener and without an operation record.
+    ///
+    /// stopping comes first on purpose: while the acceptor is extracting, a missing socket is the
+    /// expected result of beginStop closing it, not a fault. Only once that explanation is gone does
+    /// an unusable handle mean the invariant broke. This is the reference's handoff guard, which
+    /// answers Withdrawn under stop and Failed otherwise.
+    pub fn handoffDisposition(stopping: bool, failed: bool, invalid_handle: bool) Disposition {
+        if (stopping or failed) return .withdraw;
+        if (invalid_handle) return .fatal;
+        return .handoff;
+    }
+
     /// Completion statuses an accept can recover from instead of failing the listener. A peer that
     /// resets or is deleted between the accept and the completion is a connection-level event.
     pub fn acceptErrorIsRecoverable(status: i32) bool {
@@ -858,6 +917,8 @@ pub const acceptor = struct {
                 if (acceptErrorIsRecoverable(code)) return .{ .repost = index };
                 return .{ .fail = .{ .index = index, .code = code } };
             }
+            // The caller withdraws a completion that races the stop before it reaches here, so a
+            // handoff decision is only ever produced while admission is still running.
             if (self.worker_count == 0) {
                 return .{ .fail = .{ .index = index, .code = c.ERROR_INVALID_DATA } };
             }
@@ -883,6 +944,18 @@ pub const acceptor = struct {
             // A stopping acceptor retires the slot without arming another post.
             if (self.stopping) return .none;
             return .{ .repost = index };
+        }
+
+        /// Returns a slot to idle after its completion was withdrawn rather than acted on, from
+        /// either state a pending completion can leave behind.
+        ///
+        /// This is the reference's abort_handoff, generalised to the posted case: the same slot is
+        /// withdrawn whether the stop closed its socket before the completion arrived (posted) or
+        /// after this acceptor had already decided to hand it to a worker (transit). Without it a
+        /// slot whose socket disappeared would stay live forever, and the acceptor would wait for a
+        /// completion that has already been consumed.
+        pub fn returnSlot(self: *Core, index: u32) bool {
+            return self.transition(index, .posted, .idle) or self.transition(index, .transit, .idle);
         }
 
         /// Starts the credit scan at the candidate the rotation chose and takes the first worker that
@@ -1050,8 +1123,11 @@ pub const acceptor = struct {
         self.listener.deinit();
         for (self.operations) |*operation| {
             // Closing the accepted socket cancels its outstanding AcceptEx; the completion is then
-            // retired by the loop instead of leaving the operation posted forever.
-            if (self.core.dispositionFor(operation.index) == .close_posted) closeAccepted(operation);
+            // retired by the loop instead of leaving the operation posted forever. The close is
+            // unconditional and idempotent: a slot that is not posted owns nothing, and a posted slot
+            // may still be closed under a completion that arrives after this point -- which is exactly
+            // why the handoff path has to be able to withdraw. Both references close every slot here.
+            closeAccepted(operation);
         }
     }
 
@@ -1065,24 +1141,35 @@ pub const acceptor = struct {
         if (c.SetEvent(self.ready_event.get()) == c.FALSE) failFast("SetEvent(acceptor ready)", c.GetLastError());
     }
 
+    /// Retires a slot whose completion this acceptor will not act on: the socket it holds is closed
+    /// and the slot returns to idle without arming another post. The transition is the same whether
+    /// the slot was still posted or already moved to transit for a handoff.
+    fn withdrawSlot(self: *Acceptor, operation: *Operation) void {
+        if (!self.core.returnSlot(operation.index)) failFast("accept withdrawal state", c.ERROR_INVALID_STATE);
+        closeAccepted(operation);
+    }
+
     fn completeAccept(self: *Acceptor, operation: *Operation, packet_ok: bool, native_error: u32) void {
-        var accept_bytes: c.DWORD = 0;
-        var flags: c.DWORD = 0;
-        var completion_error: i32 = @bitCast(native_error);
-        const completed = c.WSAGetOverlappedResult(self.listener.get(), &operation.overlapped, &accept_bytes, c.FALSE, &flags);
-        if (completed == c.FALSE) completion_error = c.WSAGetLastError();
-        // The decision is the core's: it moves the slot and names the next step. The loop has already
-        // proved this slot is posted and owned, so the only outcomes here are the ones a real
+        // GetQueuedCompletionStatus is the single completion source here, exactly as in the
+        // reference: the dequeue reports the I/O outcome and its error, so a second
+        // WSAGetOverlappedResult query could only disagree with it. AcceptEx transfers no payload
+        // this server consumes, and the extra call would name the listener rather than the accepted
+        // socket. The decision is the core's: it moves the slot and names the next step. The loop has
+        // already proved this slot is posted and owned, so the only outcomes here are the ones a real
         // completion produces, and every one of them is executed below rather than decided here.
-        switch (self.core.onCompletion(operation.index, packet_ok, completion_error)) {
+        switch (self.core.onCompletion(operation.index, packet_ok, @bitCast(native_error))) {
             .none => return,
             .fail => |failure| {
+                // The slot is unposted by beginStop, so a failure that arrives under stopping is the
+                // cancellation the stop asked for and is not a fault of this run. See
+                // acceptorCountsFailure for why the global failure flag stays out of the ledger too.
+                if (acceptorCountsFailure(self.core.stopping, self.failed.?.load(.acquire))) self.core.network_errors +%= 1;
                 closeAccepted(operation);
                 failAndStop(self, "AcceptEx completion", @bitCast(failure.code));
             },
             .repost => {
                 closeAccepted(operation);
-                if (!postAccept(self, operation)) failAndStop(self, "AcceptEx repost", @bitCast(completion_error));
+                if (!postAccept(self, operation)) failAndStop(self, "AcceptEx repost", native_error);
             },
             .handoff => |handoff| executeHandoff(self, operation, handoff.worker),
         }
@@ -1092,6 +1179,25 @@ pub const acceptor = struct {
     /// take a worker credit and publish. All of it is I/O -- the slot is already in transit, so a
     /// failure here retires it rather than re-deciding.
     fn executeHandoff(self: *Acceptor, operation: *Operation, candidate: u32) void {
+        // The withdrawal guard, matching the reference. A successful AcceptEx completion can still be
+        // sitting in the port when the stop arrives: beginStop closes the listener and every socket
+        // whose slot is still posted, and that socket is exactly the one this handoff would configure.
+        // A withdrawing acceptor closes the slot instead of calling SO_UPDATE_ACCEPT_CONTEXT on a
+        // socket that is already gone, and the close is idempotent because beginStop leaves
+        // INVALID_SOCKET behind, so an unpost that raced the completion retires quietly and is not
+        // counted as a new network fault. The decision itself is the pure one above.
+        const invalid_handle = self.listener.get() == c.INVALID_SOCKET or operation.socket == c.INVALID_SOCKET;
+        switch (handoffDisposition(self.core.stopping, self.failed.?.load(.acquire), invalid_handle)) {
+            .withdraw => {
+                withdrawSlot(self, operation);
+                return;
+            },
+            .fatal => {
+                failAndStop(self, "AcceptEx handoff invariant", c.WSAENOTSOCK);
+                return;
+            },
+            .handoff => {},
+        }
         const configuration = native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) orelse
             native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true);
         if (configuration) |failure| {
@@ -1155,6 +1261,14 @@ pub const acceptor = struct {
         publishReady(self, posted);
 
         while (!self.core.stopping or self.liveCount() != 0) {
+            // A worker that failed publishes the global flag before the coordinator posts the stop
+            // control message. Unposting here instead of waiting for that message keeps this acceptor
+            // from admitting connections into a run that is already failing, which is what the
+            // reference does with the same test at the top of its loop.
+            if (!self.core.stopping and self.failed.?.load(.acquire)) {
+                beginStop(self);
+                if (self.liveCount() == 0) break;
+            }
             const packet = native.rio.getQueuedCompletionStatus(self.port.get(), 100);
             if (packet.overlapped == null and packet.key == types.stop_key) {
                 beginStop(self);

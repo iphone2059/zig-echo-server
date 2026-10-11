@@ -517,6 +517,134 @@ test "the accept completion decision is pure and total" {
     try std.testing.expect(credits[0].tryReserve());
     try std.testing.expectEqual(@as(?u32, 1), core.reserveWorker(0, &credits));
 }
+test "a successful completion that races the stop is withdrawn instead of configured" {
+    // Mirrors native_stop_consumes_deferred_repost_without_starting_a_fifth_accept's counterpart on
+    // the success path, and is the regression for SO_UPDATE_ACCEPT_CONTEXT returning WSAENOTSOCK.
+    // The sequence is the one the acceptor actually runs: AcceptEx is posted, a connection arrives so
+    // the port holds a *successful* completion, and beginStop closes that socket before the loop
+    // dequeues the packet. The completion then names a slot that is posted but has no socket.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    core.worker_count = 1;
+    try std.testing.expect(core.transition(0, .idle, .posted));
+
+    // beginStop: the listener goes away and every posted slot's socket is closed.
+    core.stop();
+    try std.testing.expectEqual(acceptor.SlotDisposition.close_posted, core.dispositionFor(0));
+
+    // The successful packet is still taken off the port, and the core still answers with a handoff --
+    // which is exactly why the runtime needs the guard rather than the core alone.
+    try std.testing.expectEqual(@as(u32, 0), core.onCompletion(0, true, types.error_success).handoff.worker);
+    try std.testing.expectEqual(acceptor.State.transit, core.state(0).?);
+
+    // The guard withdraws on the acceptor's own stop state, so the closed socket is never configured.
+    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(core.stopping, false, true));
+    try std.testing.expect(core.returnSlot(0));
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+    try std.testing.expectEqual(@as(u32, 0), core.liveCount());
+    // A withdrawal is not a fault: the ledger the shutdown path reports stays untouched.
+    try std.testing.expectEqual(@as(u64, 0), core.network_errors);
+}
+
+test "a failed completion under stop stays out of the network ledger" {
+    // The other half of the same race: the stop cancels the pending AcceptEx, so its completion
+    // arrives failed. That cancellation is what beginStop asked for, and counting it would report a
+    // healthy shutdown as a network failure and change the process exit code.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    core.worker_count = 1;
+    try std.testing.expect(core.transition(0, .idle, .posted));
+    core.stop();
+
+    // A cancelled accept is retired without a decision and without a single-use token.
+    try std.testing.expectEqual(acceptor.AcceptAction.none, core.onCompletion(0, false, types.error_io_incomplete));
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+    try std.testing.expect(!acceptor.acceptorCountsFailure(core.stopping, false));
+    try std.testing.expectEqual(@as(u64, 0), core.network_errors);
+
+    // A run that is already failing has been reported once; it does not accumulate more, which is
+    // what both references do with the same pair of conditions.
+    try std.testing.expect(!acceptor.acceptorCountsFailure(false, true));
+    try std.testing.expect(!acceptor.acceptorCountsFailure(true, true));
+
+    // The positive control: the same failure while admission is healthy is a real fault and still has
+    // to be counted, so the rule cannot pass by refusing every failure.
+    var running: [1]acceptor.State = undefined;
+    var live_core = acceptor.Core.init(&running);
+    live_core.worker_count = 1;
+    try std.testing.expect(live_core.transition(0, .idle, .posted));
+    const failed = live_core.onCompletion(0, false, types.error_not_enough_memory);
+    try std.testing.expectEqual(types.error_not_enough_memory, failed.fail.code);
+    try std.testing.expect(acceptor.acceptorCountsFailure(live_core.stopping, false));
+}
+
+
+test "a handoff reaching a stopping worker is withdrawn rather than adopted" {
+    // The worker half of the same race: the acceptor publishes a handoff, and before the worker
+    // dequeues it the worker's stop closes admission. Without this rule the worker would open a
+    // request queue for a socket nobody owns any more, and report the resulting WSAENOTSOCK as a
+    // network fault.
+    try std.testing.expect(tcp.withdrawsHandoff(true));
+    // The positive controls: a worker that is still running adopts the socket, and reaching the
+    // admission barrier is not yet a stop, so a real request-queue failure there is still reported
+    // rather than swallowed as a withdrawal.
+    try std.testing.expect(!tcp.withdrawsHandoff(false));
+
+    // The engine refuses the slot for exactly that state, which is what makes the withdrawal above
+    // the only reachable outcome for a stopped worker rather than one of two.
+    var engine_value = try server.TcpEngine.init(1, 5_000);
+    defer engine_value.deinit();
+    try std.testing.expect(engine_value.takeSlot() != null);
+    engine_value.returnSlot(0);
+    var steps: [4]server.Step = undefined;
+    _ = engine_value.beginStop(&steps);
+    try std.testing.expectEqual(@as(?u32, null), engine_value.takeSlot());
+}
+test "the handoff guard separates a stop from a broken invariant" {
+    // The whole decision table, with no listener, no socket and no operation record. The first case
+    // is the withdrawal that keeps SO_UPDATE_ACCEPT_CONTEXT off a closed socket; the second is the
+    // invariant failure that must not be silently withdrawn; the third is the positive control that
+    // keeps the guard from refusing every handoff.
+    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(true, false, false));
+    // A stop owns the explanation even when the handle already looks invalid.
+    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(true, false, true));
+    // The global failure flag unposts this acceptor too, so the same withdrawal applies.
+    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(false, true, false));
+    // Out of stop an unusable handle has no benign reading.
+    try std.testing.expectEqual(acceptor.Disposition.fatal, acceptor.handoffDisposition(false, false, true));
+    try std.testing.expectEqual(acceptor.Disposition.handoff, acceptor.handoffDisposition(false, false, false));
+}
+
+test "a slot is reused only after its handoff is acknowledged" {
+    // Mirrors the single-owner rule the reference states on close_accept_socket: the socket belongs
+    // to the acceptor while the operation is posted and to the worker once it is handed off, so the
+    // slot may not accept a new connection until the acknowledgement comes back.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    core.worker_count = 1;
+
+    _ = core.transition(0, .idle, .posted);
+    _ = core.onCompletion(0, true, types.error_success);
+    try std.testing.expectEqual(acceptor.State.transit, core.state(0).?);
+
+    // In transit the slot owns nothing to repost and may not be posted again.
+    try std.testing.expectEqual(acceptor.SlotDisposition.wait_ack, core.dispositionFor(0));
+    try std.testing.expect(!core.transition(0, .transit, .posted));
+
+    // A stray acknowledgement cannot retire a slot that never reached transit, and one withdrawal
+    // cannot be applied twice.
+    try std.testing.expect(!core.returnSlot(1));
+    try std.testing.expect(core.returnSlot(0));
+    try std.testing.expect(!core.returnSlot(0));
+
+    // Only now is the slot reusable, and the rotation still names a real worker.
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+    try std.testing.expect(core.transition(0, .idle, .posted));
+    try std.testing.expectEqual(@as(u32, 0), core.onCompletion(0, true, types.error_success).handoff.worker);
+    try std.testing.expectEqual(@as(u32, 0), core.onAck(0).repost);
+    try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
+}
+
 test "a deferred repost is consumed before the acceptor shuts down" {
     // Mirrors deferred_reposts_are_consumed_before_acceptor_shutdown. A slot that yielded to a queued
     // repost is still live, so the acceptor may not stop while it is outstanding; retiring it under

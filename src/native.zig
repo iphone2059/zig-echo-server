@@ -41,6 +41,7 @@ pub const sdk = struct {
         pub const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000024;
         pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xC8000006;
         pub const WSAEINVAL: i32 = 10022;
+        pub const WSAENOTSOCK: i32 = 10038;
         pub const WSAECONNRESET: i32 = 10054;
         pub const SOMAXCONN: c_int = 0x7fffffff;
 
@@ -219,7 +220,8 @@ pub const sdk = struct {
         pub extern fn listen(socket: SOCKET, backlog: c_int) callconv(.winapi) c_int;
         pub extern fn connect(socket: SOCKET, address: *const SOCKADDR, address_length: c_int) callconv(.winapi) c_int;
         pub extern fn WSAIoctl(socket: SOCKET, code: DWORD, in_buffer: ?*anyopaque, in_bytes: DWORD, out_buffer: ?*anyopaque, out_bytes: DWORD, bytes_returned: *DWORD, overlapped: ?*OVERLAPPED, completion: ?*anyopaque) callconv(.winapi) c_int;
-        pub extern fn WSAGetOverlappedResult(socket: SOCKET, overlapped: *OVERLAPPED, transferred: *DWORD, wait: BOOL, flags: *DWORD) callconv(.winapi) BOOL;
+        // WSAGetOverlappedResult is deliberately not declared: GetQueuedCompletionStatus is the only
+        // completion source this server reads, so no second query can disagree with it.
         pub extern fn htons(value: u16) callconv(.winapi) u16;
         pub extern fn htonl(value: u32) callconv(.winapi) u32;
 
