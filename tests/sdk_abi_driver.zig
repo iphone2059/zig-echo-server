@@ -1,6 +1,6 @@
 const std = @import("std");
 const server = @import("server");
-const c = server.sdk.c;
+const c = server.native.sdk.c;
 
 pub fn main() u8 {
     var buffer: [1024]u8 = undefined;
@@ -22,5 +22,5 @@ pub fn main() u8 {
         c.SO_UPDATE_ACCEPT_CONTEXT,                       @offsetOf(c.SOCKADDR_IN, "sin_port"), @offsetOf(c.OVERLAPPED, "hEvent"),      @offsetOf(c.RIORESULT, "RequestContext"),
         @offsetOf(c.RIO_NOTIFICATION_COMPLETION, "Iocp"),
     }) catch return 4;
-    return if (server.win32.writeStdout(output)) 0 else 4;
+    return if (server.native.diagnostics.writeStdout(output)) 0 else 4;
 }

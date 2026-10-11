@@ -1,6 +1,11 @@
+//! Drives a real acceptor and one worker with a live listener, so the accept window, the admission
+//! credits and the shutdown barrier are exercised against the machine rather than a model.
+
 const std = @import("std");
 const server = @import("server");
-const c = server.win32.c;
+const c = server.native.sdk.c;
+const acceptor = server.acceptor;
+const tcp = server.tcp;
 
 pub fn main(init: std.process.Init) u8 {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return 4;
@@ -22,47 +27,60 @@ pub fn main(init: std.process.Init) u8 {
         .quiet = true,
     };
 
-    var winsock = server.win32.Winsock.init() catch return 2;
+    const capacity = server.server.slotCapacity(&options, 1, 0);
+    if (capacity == 0) return 2;
+    var winsock = server.native.winsock.Winsock.init() catch return 2;
     defer winsock.deinit();
-    var api = server.rio.Api.load() catch return 2;
+    const api = server.native.rio.Api.load() catch return 2;
     var failed = std.atomic.Value(bool).init(false);
-    var worker: server.engine_internal.Worker = .{};
-    var worker_resources: server.tcp_worker.WorkerResources = .{};
-    server.tcp_worker.initializeWorker(&worker, &api, &options, &failed, 0, 1, &worker_resources) catch return 2;
-    if (!server.tcp_worker.startWorker(&worker)) {
-        server.tcp_worker.postAdmissionClosed(&worker);
-        server.tcp_worker.postStop(&worker);
-        server.tcp_worker.destroyWorker(&worker);
+    var worker: server.internal.TcpWorker = .{};
+    var credits: [1]acceptor.AdmissionCredits = .{acceptor.AdmissionCredits.init(capacity)};
+    tcp.initialize(&worker, &api, &options, &failed, 0, capacity, &credits[0]) catch return 2;
+    if (!tcp.start(&worker)) {
+        tcp.postAdmissionClosed(&worker);
+        tcp.postStop(&worker);
+        tcp.destroy(&worker);
         return 2;
     }
 
-    var acceptor: server.engine_internal.Acceptor = .{};
-    var acceptor_resources: server.tcp_acceptor.AcceptorResources = .{};
-    server.tcp_acceptor.initializeAcceptor(&acceptor, &api, &options, @as([*]server.engine_internal.Worker, @ptrCast(&worker))[0..1], &failed, &acceptor_resources) catch {
-        server.tcp_worker.postAdmissionClosed(&worker);
-        server.tcp_worker.postStop(&worker);
-        server.tcp_worker.destroyWorker(&worker);
+    var acceptor_value: acceptor.Acceptor = .{};
+    const worker_slice: []server.internal.TcpWorker = @as([*]server.internal.TcpWorker, @ptrCast(&worker))[0..1];
+    acceptor.initialize(&acceptor_value, &api, &options, worker_slice, credits[0..], &failed) catch {
+        tcp.postAdmissionClosed(&worker);
+        tcp.postStop(&worker);
+        tcp.destroy(&worker);
         return 2;
     };
-    if (!server.tcp_acceptor.startAcceptor(&acceptor)) {
-        if (acceptor.thread != null) server.tcp_acceptor.stopAcceptor(&acceptor) else server.tcp_worker.postAdmissionClosed(&worker);
-        server.tcp_acceptor.destroyAcceptor(&acceptor);
-        server.tcp_worker.postStop(&worker);
-        server.tcp_worker.destroyWorker(&worker);
+    if (!acceptor.start(&acceptor_value)) {
+        acceptor.stop(&acceptor_value);
+        acceptor.destroy(&acceptor_value);
+        tcp.postAdmissionClosed(&worker);
+        tcp.postStop(&worker);
+        tcp.destroy(&worker);
         return 2;
     }
 
     c.Sleep(run_seconds * 1000);
-    server.tcp_acceptor.stopAcceptor(&acceptor);
-    server.tcp_acceptor.joinAcceptor(&acceptor);
-    server.tcp_worker.postStop(&worker);
-    server.tcp_worker.joinWorker(&worker);
-    const active = worker.active_count;
-    server.tcp_acceptor.destroyAcceptor(&acceptor);
-    server.tcp_worker.destroyWorker(&worker);
+    // The shutdown barrier, in the order server.zig uses it: the acceptor first, then admission,
+    // then the workers, then the join.
+    acceptor.stop(&acceptor_value);
+    acceptor.destroy(&acceptor_value);
+    tcp.postAdmissionClosed(&worker);
+    tcp.postStop(&worker);
+    tcp.join(&worker);
+    const active = worker.engine_value.activeCount();
+    const outstanding = worker.engine_value.outstanding();
+    const pending_handoffs = credits[0].pending;
+    tcp.destroy(&worker);
 
-    var output_buffer: [128]u8 = undefined;
-    const output = std.fmt.bufPrint(&output_buffer, "tcp_driver active={d} failed={s}\n", .{ active, if (failed.load(.acquire)) "true" else "false" }) catch return 4;
-    if (!server.win32.writeStdout(output)) return 4;
+    var output_buffer: [192]u8 = undefined;
+    const output = std.fmt.bufPrint(&output_buffer, "tcp_driver active={d} outstanding={d} handoffs={d} failed={s}\n", .{
+        active,
+        outstanding,
+        pending_handoffs,
+        if (failed.load(.acquire)) "true" else "false",
+    }) catch return 4;
+    if (!server.native.diagnostics.writeStdout(output)) return 4;
+    if (active != 0 or outstanding != 0 or pending_handoffs != 0) return 2;
     return if (failed.load(.acquire)) 2 else 0;
 }

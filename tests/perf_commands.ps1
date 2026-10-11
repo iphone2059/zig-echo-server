@@ -70,11 +70,11 @@ function Test-BenchmarkRun {
         -not [string]::Equals($Run.server_sha256,$Run.expected_server_sha256,[StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals([IO.Path]::GetFullPath($Run.server_path),[IO.Path]::GetFullPath($Run.expected_server_path),[StringComparison]::OrdinalIgnoreCase)) { return $false }
     if ($StopRecord.protocol -ceq 'tcp') {
-        return $StopRecord.terminal_line -match '^final protocol=tcp\b.*\bactive=0$' -and
+        return $StopRecord.terminal_line -match '^final protocol=tcp\b.*\bactive=0\b' -and
             $StopRecord.worker_count -gt 0 -and $StopRecord.worker_count -eq $StopRecord.zero_workers
     }
     if ($StopRecord.protocol -ceq 'udp') {
-        return $StopRecord.terminal_line -match '^final protocol=udp\b.*\boutstanding=0$'
+        return $StopRecord.terminal_line -match '^final protocol=udp\b.*\boutstanding=0\b'
     }
     return $false
 }

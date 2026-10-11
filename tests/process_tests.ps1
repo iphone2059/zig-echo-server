@@ -91,9 +91,9 @@ try {
     $serverTcpError = Get-Content -Raw -LiteralPath $serverTcpStderr
     $serverTcpOutput = Get-Content -Raw -LiteralPath $serverTcpStdout
     if ($serverTcpError.Length -ne 0) { throw "Successful TCP server wrote to stderr: $serverTcpError" }
-    $workerLines = [regex]::Matches($serverTcpOutput, '(?m)^\[worker \d+\] accepted=\d+ completions=\d+ receives=\d+ sends=\d+ bytes=\d+ active=0\r?$')
-    if ($workerLines.Count -ne 2) { throw "Expected two exact per-worker statistics lines: $serverTcpOutput" }
-    if ($serverTcpOutput -notmatch '(?m)^final protocol=tcp elapsed_ms=\d+ accepted=\d+ completions=\d+ receives=\d+ sends=\d+ bytes=\d+ MiB_per_sec=\d+\.\d{2} active=0\r?$') {
+    # The terminal line is the reference schema for both protocols: one aggregate line, in the
+    # reference's field order, with no per-worker lines.
+    if ($serverTcpOutput -notmatch '(?m)^final protocol=tcp elapsed_ms=\d+ workers=\d+ accepted=\d+ active=0 outstanding=\d+ completions=\d+ receives=\d+ sends=\d+ received_bytes=\d+ sent_bytes=\d+ bytes=\d+ network_errors=\d+ rejected=\d+ MiB_per_sec=\d+\.\d{2}\r?$') {
         throw "TCP aggregate statistics schema mismatch: $serverTcpOutput"
     }
 
@@ -174,7 +174,9 @@ try {
     $tcpError = Get-Content -Raw -LiteralPath $tcpStderr
     $tcpOutput = Get-Content -Raw -LiteralPath $tcpStdout
     if ($tcpError.Length -ne 0) { throw "Successful TCP acceptor driver wrote to stderr: $tcpError" }
-    if ($tcpOutput -notmatch '^tcp_driver active=0 failed=false\r?\n?$') { throw "TCP acceptor terminal state mismatch: $tcpOutput" }
+    # The driver reports the full shutdown barrier, so a terminal state that only looks idle is not
+    # enough: the RIO requests and the published handoffs have to be retired as well.
+    if ($tcpOutput -notmatch '^tcp_driver active=0 outstanding=0 handoffs=0 failed=false\r?\n?$') { throw "TCP acceptor terminal state mismatch: $tcpOutput" }
 
     $serverProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'udp', '/s', $port, '/w', '3', '/k', '64', '/cq', '256', '/memory', '67108864', '/q', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     Start-Sleep -Milliseconds 350
@@ -222,7 +224,7 @@ try {
     $stdout = Get-Content -Raw -LiteralPath $stdoutPath
     $stderr = Get-Content -Raw -LiteralPath $stderrPath
     if ($stderr.Length -ne 0) { throw "Successful UDP server wrote to stderr: $stderr" }
-    $pattern = '^final protocol=udp elapsed_ms=\d+ completions=\d+ receives=\d+ sends=\d+ bytes=\d+ MiB_per_sec=\d+\.\d{2} outstanding=0\r?\n?$'
+    $pattern = '^final protocol=udp elapsed_ms=\d+ workers=\d+ accepted=\d+ active=0 outstanding=0 completions=\d+ receives=\d+ sends=\d+ received_bytes=\d+ sent_bytes=\d+ bytes=\d+ network_errors=\d+ rejected=\d+ MiB_per_sec=\d+\.\d{2}\r?\n?$'
     if ($stdout -notmatch $pattern) { throw "UDP statistics schema/stdout mismatch: $stdout" }
 
     $stopDriver = Join-Path (Split-Path -Parent $server) 'zig-echo-server-udp-stop-driver.exe'

@@ -1,6 +1,9 @@
+//! Starts a real datagram run and asks it to stop from another thread, so the controlled-stop path
+//! is exercised end to end rather than only through a unit-level flag.
+
 const std = @import("std");
 const server = @import("server");
-const c = server.win32.c;
+const c = server.native.sdk.c;
 
 fn requestStop(stop: *std.atomic.Value(bool)) void {
     c.Sleep(750);
@@ -15,17 +18,17 @@ pub fn main(init: std.process.Init) u8 {
         .protocol = .udp,
         .port = port,
         .udp_depth = 64,
-        .rio_buffer_bytes = server.types.max_udp_payload,
+        .rio_buffer_bytes = @intCast(server.types.maximum_udp_payload),
         .cq_capacity = 256,
         .memory_bytes = 67108864,
         .quiet = true,
         .stats = true,
     };
-    var winsock = server.win32.Winsock.init() catch return 2;
+    var winsock = server.native.winsock.Winsock.init() catch return 2;
     defer winsock.deinit();
-    var api = server.rio.Api.load() catch return 2;
+    const api = server.native.rio.Api.load() catch return 2;
     var stop = std.atomic.Value(bool).init(false);
     const thread = std.Thread.spawn(.{}, requestStop, .{&stop}) catch return 4;
     defer thread.join();
-    return @backingInt(server.udp.run(&api, &options, &stop));
+    return @backingInt(server.udp.runtime.run(&api, &options, &stop));
 }

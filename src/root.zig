@@ -1,29 +1,35 @@
-pub const types = @import("types.zig");
-pub const options = @import("ces_contract.zig");
-pub const contract = @import("ces_contract.zig");
-pub const timer_heap = @import("timer_heap.zig");
-pub const sdk = @import("sdk.zig");
-pub const win32 = @import("win32.zig");
-pub const fault_guards = @import("fault_guards.zig");
-pub const rio = @import("rio.zig");
-pub const udp = @import("udp.zig");
-pub const engine_internal = @import("engine_internal.zig");
-pub const tcp_worker = @import("tcp_worker.zig");
-pub const tcp_acceptor = @import("tcp_acceptor.zig");
+//! Windows x64 RIO echo server core.
+//!
+//! The module tree mirrors the Rust server file for file: contract (command line and capacity
+//! budgets) -> native (Winsock, RIO, AcceptEx and every resource owner) -> engine (the pure TCP
+//! state machine) -> internal (acceptor, connection, UDP, worker, timer) -> server (dispatch and
+//! shutdown) -> main (entry point).
+
+const std = @import("std");
+
+pub const contract = @import("contract.zig");
 pub const engine = @import("engine.zig");
+pub const internal = @import("internal.zig");
+pub const native = @import("native.zig");
+pub const server = @import("server.zig");
+pub const types = @import("types.zig");
+
+/// The names the state machines are reached by, re-exported so a test never has to spell out the
+/// full path and so the shape of internal stays free to change.
+pub const acceptor = internal.acceptor;
+pub const connection = internal.connection;
+pub const udp = internal.udp;
+pub const worker = internal.worker;
+pub const tcp = internal.worker.tcp;
+pub const timer = internal.worker.timer;
+pub const TcpEngine = engine.TcpEngine;
+pub const Step = engine.Step;
 
 test {
-    _ = types;
-    _ = options;
     _ = contract;
-    _ = timer_heap;
-    _ = sdk;
-    _ = win32;
-    _ = rio;
-    _ = udp;
-    _ = engine_internal;
-    _ = tcp_worker;
-    _ = tcp_acceptor;
     _ = engine;
+    _ = internal;
+    _ = native;
+    _ = server;
+    _ = types;
 }
-

@@ -70,7 +70,8 @@ $stderr=Get-Content -LiteralPath $StderrPath -Raw
 if ($null -eq $stdout) { $stdout='' }
 if ($null -eq $stderr) { $stderr='' }
 $terminal=@(($stdout -split "`r?`n") | Where-Object { $_ -match '^final ' } | Select-Object -Last 1)
-$workerLines=@(($stdout -split "`r?`n") | Where-Object { $_ -match '^\[worker \d+\] ' })
+# The terminal line is the reference schema: one aggregate line and no per-worker lines.
+$workerLines=@()
 $zeroWorkers=@($workerLines | Where-Object { $_ -match '\bactive=0$' })
 $record=[pscustomobject]@{
     protocol=$Protocol; exit_code=$exitCode; stderr_length=$stderr.Length
@@ -82,9 +83,9 @@ $record=[pscustomobject]@{
 }
 $record | Add-Member -NotePropertyName valid -NotePropertyValue (
     $record.exit_code -eq 0 -and $record.stderr_length -eq 0 -and (
-        ($Protocol -ceq 'tcp' -and $record.terminal_line -match '^final protocol=tcp\b.*\bactive=0$' -and
+        ($Protocol -ceq 'tcp' -and $record.terminal_line -match '^final protocol=tcp\b.*\bactive=0\b' -and
             $record.worker_count -eq $WorkerCount -and $record.zero_workers -eq $WorkerCount) -or
-        ($Protocol -ceq 'udp' -and $record.terminal_line -match '^final protocol=udp\b.*\boutstanding=0$')))
+        ($Protocol -ceq 'udp' -and $record.terminal_line -match '^final protocol=udp\b.*\boutstanding=0\b')))
 $null=New-Item -ItemType Directory -Path $OutputDirectory -Force
 $path=Join-Path $OutputDirectory ('stop-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')+'.json')
 $record | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding utf8
