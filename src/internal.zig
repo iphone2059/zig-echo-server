@@ -1274,22 +1274,90 @@ pub const udp = struct {
     pub const Slot = struct {
         payload: c.RIO_BUF = .{ .BufferId = c.RIO_INVALID_BUFFERID, .Offset = 0, .Length = 0 },
         remote_address: c.RIO_BUF = .{ .BufferId = c.RIO_INVALID_BUFFERID, .Offset = 0, .Length = 0 },
-        operation: types.EngineOperation = .receive,
-        outstanding: bool = false,
-        /// The datagram length the last receive produced. Zero is a legal datagram and must be
-        /// preserved exactly, so the next receive still needs the full slot capacity.
-        received_bytes: u32 = 0,
     };
 
     /// What one completion means for its slot.
     pub const Action = enum(u8) { repost_receive, repost_send, drop, fatal };
+
+    /// The pure UDP engine: which direction each slot is armed in, the in-flight ledger, the error
+    /// classification and the statistics.
+    ///
+    /// It performs no I/O. A completion sequence can be replayed against it with no socket, request
+    /// queue or completion port, which is what makes the slot transitions and the ledger testable on
+    /// their own.
+    pub const Engine = struct {
+        /// The direction each slot is currently armed in. Ownership of a slot lives here, next to
+        /// the ledger it feeds, rather than in the native record the kernel writes.
+        directions: []types.EngineOperation = &.{},
+        /// Operations the provider still owns. The loop may only end, and the arena may only be
+        /// released, once this is back to zero.
+        outstanding: u32 = 0,
+        statistics: types.Statistics = .{},
+        /// The socket is closed, so no further post is legitimate and completions only retire.
+        closing: bool = false,
+
+        pub fn init(directions: []types.EngineOperation) Engine {
+            @memset(directions, .receive);
+            return .{ .directions = directions };
+        }
+
+        pub fn direction(self: *const Engine, index: u32) types.EngineOperation {
+            return if (index < self.directions.len) self.directions[index] else .receive;
+        }
+
+        /// The runtime armed a slot, so ownership moved to the provider.
+        pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) void {
+            if (index < self.directions.len) self.directions[index] = operation;
+            self.outstanding +%= 1;
+        }
+
+        pub fn hasWork(self: *const Engine) bool {
+            return self.outstanding != 0;
+        }
+
+        /// The runtime is about to close the socket: no further post is legitimate, and the drain
+        /// only has to retire what is already in flight.
+        pub fn beginClose(self: *Engine) void {
+            self.closing = true;
+        }
+
+        /// The provider owns nothing, so the registered arena and the request queue may be released.
+        pub fn mayRelease(self: *const Engine) bool {
+            return self.outstanding == 0;
+        }
+
+        /// One completion: ownership is retired and the ledger and statistics move before the action
+        /// is decided, so a completion can never be accounted twice or steered twice.
+        pub fn onCompletion(self: *Engine, operation: types.EngineOperation, status: i32, bytes: u32, capacity: u32) Action {
+            if (self.outstanding == 0) return .fatal;
+            self.outstanding -= 1;
+            self.statistics.completions +%= 1;
+            switch (operation) {
+                .receive => {
+                    if (status == types.error_success) {
+                        self.statistics.receives +%= 1;
+                        self.statistics.received_bytes +%= bytes;
+                    }
+                },
+                .send => {
+                    if (status == types.error_success) {
+                        self.statistics.sends +%= 1;
+                        self.statistics.sent_bytes +%= bytes;
+                        self.statistics.bytes +%= bytes;
+                    }
+                },
+            }
+            if (self.closing) return .drop;
+            return classify(operation, status, bytes, capacity);
+        }
+    };
 
     /// Decides the next step for one completed datagram operation.
     ///
     /// A reset is recovered at the receive depth: the slot goes back to receiving without echoing
     /// anything, which is what keeps a surface that sends an ICMP port-unreachable from draining the
     /// in-flight depth.
-    pub fn onCompletion(operation: types.EngineOperation, status: i32, bytes: u32, capacity: u32) Action {
+    pub fn classify(operation: types.EngineOperation, status: i32, bytes: u32, capacity: u32) Action {
         if (status == types.wsa_econnreset) return .repost_receive;
         if (status != types.error_success) return .fatal;
         return switch (operation) {
@@ -1336,8 +1404,7 @@ pub const udp = struct {
             }
             slots[index].payload = payload;
             slots[index].remote_address = remote;
-            slots[index].operation = .receive;
-            slots[index].outstanding = true;
+
             return true;
         }
 
@@ -1351,8 +1418,7 @@ pub const udp = struct {
             }
             slots[index].payload = payload;
             slots[index].remote_address = remote;
-            slots[index].operation = .send;
-            slots[index].outstanding = true;
+
             return true;
         }
 
@@ -1408,6 +1474,11 @@ pub const udp = struct {
             };
             defer arena_value.deinit();
 
+            const directions = allocator.alloc(types.EngineOperation, options.udp_depth) catch {
+                native.diagnostics.report("allocate UDP directions", c.ERROR_NOT_ENOUGH_MEMORY);
+                return .network;
+            };
+            defer allocator.free(directions);
             const slots = allocator.alloc(Slot, options.udp_depth) catch {
                 native.diagnostics.report("allocate UDP slots", c.ERROR_NOT_ENOUGH_MEMORY);
                 return .network;
@@ -1445,8 +1516,7 @@ pub const udp = struct {
                 return .network;
             }
 
-            var outstanding: u32 = 0;
-            var statistics: types.Statistics = .{};
+            var engine_value = Engine.init(directions);
             var failed = false;
             for (0..options.udp_depth) |position| {
                 const index: u32 = @intCast(position);
@@ -1454,25 +1524,25 @@ pub const udp = struct {
                     failed = true;
                     break;
                 }
-                outstanding += 1;
+                engine_value.onPosted(index, .receive);
             }
-            if (outstanding == 0) {
+            if (!engine_value.hasWork()) {
                 // The depth could not even be armed once, so nothing can make progress.
                 socket_owner.deinit();
                 return .network;
             }
 
-            var closing = failed;
-            if (closing) socket_owner.deinit();
-            if (!closing) arm(api, &queue, &notification_overlapped);
+            if (failed) engine_value.beginClose();
+            if (engine_value.closing) socket_owner.deinit();
+            if (!engine_value.closing) arm(api, &queue, &notification_overlapped);
             const start = native.nowMilliseconds();
             var results: [types.completion_batch_size]c.RIORESULT = undefined;
 
-            while (!closing or outstanding != 0) {
-                if (!closing and (stop.load(.acquire) or
+            while (!engine_value.closing or !engine_value.mayRelease()) {
+                if (!engine_value.closing and (stop.load(.acquire) or
                     (options.run_seconds != 0 and native.nowMilliseconds() - start >= @as(u64, options.run_seconds) * 1000)))
                 {
-                    closing = true;
+                    engine_value.beginClose();
                     socket_owner.deinit();
                 }
                 const packet = native.rio.getQueuedCompletionStatus(port.get(), 100);
@@ -1492,32 +1562,17 @@ pub const udp = struct {
                             const raw = result.RequestContext orelse failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);
                             const slot: *Slot = @ptrCast(@alignCast(raw));
                             const index = validSlot(slots, slot) orelse failFast("UDP completion identity", c.ERROR_INVALID_DATA);
-                            if (!slot.outstanding or outstanding == 0) failFast("UDP completion invariant", c.ERROR_INVALID_DATA);
-                            slot.outstanding = false;
-                            outstanding -= 1;
-                            statistics.completions +%= 1;
-                            const operation = slot.operation;
-                            if (operation == .receive) {
-                                if (result.Status == types.error_success) {
-                                    statistics.receives +%= 1;
-                                    statistics.received_bytes +%= result.BytesTransferred;
-                                }
-                            } else if (result.Status == types.error_success) {
-                                statistics.sends +%= 1;
-                                statistics.sent_bytes +%= result.BytesTransferred;
-                                statistics.bytes +%= result.BytesTransferred;
-                            }
-                            if (closing) continue;
-                            switch (onCompletion(operation, result.Status, result.BytesTransferred, capacity)) {
+                            const operation = engine_value.direction(index);
+                            switch (engine_value.onCompletion(operation, result.Status, result.BytesTransferred, capacity)) {
                                 .repost_receive => {
                                     if (!postReceive(api, request_queue, &arena_value, slots, index, capacity)) {
                                         native.diagnostics.report("UDP receive repost", @intCast(c.WSAGetLastError()));
                                         failed = true;
-                                        closing = true;
+                                        engine_value.beginClose();
                                         socket_owner.deinit();
                                         continue;
                                     }
-                                    outstanding += 1;
+                                    engine_value.onPosted(index, .receive);
                                 },
                                 .repost_send => {
                                     // The datagram length is kept exactly, so a zero-byte datagram is
@@ -1526,23 +1581,23 @@ pub const udp = struct {
                                     if (!postSend(api, request_queue, &arena_value, slots, index, length, capacity)) {
                                         native.diagnostics.report("UDP send repost", @intCast(c.WSAGetLastError()));
                                         failed = true;
-                                        closing = true;
+                                        engine_value.beginClose();
                                         socket_owner.deinit();
                                         continue;
                                     }
-                                    outstanding += 1;
+                                    engine_value.onPosted(index, .send);
                                 },
                                 .drop => {},
                                 .fatal => {
                                     native.diagnostics.report("UDP RIO completion", @bitCast(result.Status));
                                     failed = true;
-                                    closing = true;
+                                    engine_value.beginClose();
                                     socket_owner.deinit();
                                 },
                             }
                         }
                     }
-                    if (outstanding != 0 and !closing) arm(api, &queue, &notification_overlapped);
+                    if (engine_value.hasWork() and !engine_value.closing) arm(api, &queue, &notification_overlapped);
                 } else if (!packet.ok and packet.native_error != c.WAIT_TIMEOUT) {
                     failFast("GetQueuedCompletionStatus(UDP)", packet.native_error);
                 } else if (!(!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null)) {
@@ -1551,12 +1606,12 @@ pub const udp = struct {
             }
 
             // Every posted datagram has retired, so the registered storage can be released.
-            native.guards.requireTransition(types.udpMayRelease(.stopped, outstanding), "UDP CQ retirement with outstanding operations");
+            native.guards.requireTransition(types.udpMayRelease(.stopped, engine_value.outstanding), "UDP CQ retirement with outstanding operations");
             queue.deinit();
 
             if (options.stats) {
                 var buffer: [512]u8 = undefined;
-                const line = statistics.writeFinalLine(.udp, native.nowMilliseconds() - start, 1, outstanding, &buffer) orelse
+                const line = engine_value.statistics.writeFinalLine(.udp, native.nowMilliseconds() - start, 1, engine_value.outstanding, &buffer) orelse
                     failFast("format UDP statistics", c.ERROR_INSUFFICIENT_BUFFER);
                 if (!native.diagnostics.writeStdout(line)) failFast("write UDP statistics", c.GetLastError());
             }

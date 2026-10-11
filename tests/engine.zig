@@ -191,13 +191,13 @@ test "the accept table only allows the documented transitions" {
 
 test "a zero-byte datagram is preserved and a reset recovers the receive depth" {
     // A completed receive always echoes the bytes it produced, including none at all.
-    try std.testing.expectEqual(udp.Action.repost_send, udp.onCompletion(.receive, types.error_success, 0, 1024));
-    try std.testing.expectEqual(udp.Action.repost_send, udp.onCompletion(.receive, types.error_success, 1024, 1024));
-    try std.testing.expectEqual(udp.Action.repost_receive, udp.onCompletion(.send, types.error_success, 1024, 1024));
+    try std.testing.expectEqual(udp.Action.repost_send, udp.classify(.receive, types.error_success, 0, 1024));
+    try std.testing.expectEqual(udp.Action.repost_send, udp.classify(.receive, types.error_success, 1024, 1024));
+    try std.testing.expectEqual(udp.Action.repost_receive, udp.classify(.send, types.error_success, 1024, 1024));
     // A reset restores the receive depth without echoing anything.
-    try std.testing.expectEqual(udp.Action.repost_receive, udp.onCompletion(.receive, types.wsa_econnreset, 0, 1024));
-    try std.testing.expectEqual(udp.Action.repost_receive, udp.onCompletion(.send, types.wsa_econnreset, 0, 1024));
-    try std.testing.expectEqual(udp.Action.fatal, udp.onCompletion(.receive, types.error_invalid_data, 0, 1024));
+    try std.testing.expectEqual(udp.Action.repost_receive, udp.classify(.receive, types.wsa_econnreset, 0, 1024));
+    try std.testing.expectEqual(udp.Action.repost_receive, udp.classify(.send, types.wsa_econnreset, 0, 1024));
+    try std.testing.expectEqual(udp.Action.fatal, udp.classify(.receive, types.error_invalid_data, 0, 1024));
     try std.testing.expectEqual(@as(u32, 0), udp.receiveLength(0, 1024));
     try std.testing.expectEqual(@as(u32, 1024), udp.receiveLength(4096, 1024));
 }
@@ -217,15 +217,46 @@ test "the RIO request context round trips and rejects a forged value" {
     try std.testing.expect(server.worker.context.decode(1 << 40, 8) == null);
 }
 
-test "the datagram slot keeps its operation and length separately" {
-    var slot = udp.Slot{};
-    try std.testing.expectEqual(types.EngineOperation.receive, slot.operation);
-    try std.testing.expect(!slot.outstanding);
-    try std.testing.expectEqual(@as(u32, 0), slot.received_bytes);
-    // The receive length is remembered exactly, so a zero-byte datagram stays zero bytes.
-    slot.received_bytes = 0;
-    slot.operation = .send;
-    try std.testing.expectEqual(@as(u32, 0), udp.receiveLength(slot.received_bytes, 1024));
+test "the datagram engine owns the direction and the in-flight ledger" {
+    // The engine is pure, so the whole slot cycle is replayed here with no socket, request queue or
+    // completion port in the room.
+    var directions: [2]types.EngineOperation = undefined;
+    var engine_value = udp.Engine.init(&directions);
+    try std.testing.expect(!engine_value.hasWork());
+    try std.testing.expect(engine_value.mayRelease());
+
+    // Arming a slot moves its ownership to the provider and into the ledger.
+    engine_value.onPosted(0, .receive);
+    engine_value.onPosted(1, .receive);
+    try std.testing.expectEqual(@as(u32, 2), engine_value.outstanding);
+    try std.testing.expectEqual(types.EngineOperation.receive, engine_value.direction(0));
+
+    // A completed receive echoes its exact length, and the send it arms is what the ledger holds.
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 7, 1024));
+    try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
+    engine_value.onPosted(0, .send);
+    try std.testing.expectEqual(types.EngineOperation.send, engine_value.direction(0));
+    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(.send, types.error_success, 7, 1024));
+    try std.testing.expectEqual(@as(u32, 1), engine_value.outstanding);
+
+    // The ledger and the statistics are the engine's, not the loop's.
+    try std.testing.expectEqual(@as(u64, 2), engine_value.statistics.completions);
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.receives);
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.sends);
+    try std.testing.expectEqual(@as(u64, 7), engine_value.statistics.received_bytes);
+    try std.testing.expectEqual(@as(u64, 7), engine_value.statistics.sent_bytes);
+
+    // A closed socket retires completions without arming anything further, so the drain ends.
+    // A closed socket retires what is still in flight without arming anything further, and the slot
+    // that was never echoed is what the last completion returns.
+    engine_value.beginClose();
+    try std.testing.expectEqual(udp.Action.drop, engine_value.onCompletion(.receive, types.error_success, 7, 1024));
+    try std.testing.expect(!engine_value.hasWork());
+    try std.testing.expect(engine_value.mayRelease());
+
+    // One retirement past the ledger is an invariant failure, not a decrement under zero.
+    try std.testing.expectEqual(udp.Action.fatal, engine_value.onCompletion(.receive, types.error_success, 0, 1024));
+    try std.testing.expect(!engine_value.hasWork());
 }
 
 fn xorshift(state: *u32) u32 {
