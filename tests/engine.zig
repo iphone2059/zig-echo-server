@@ -159,20 +159,34 @@ test "accept errors recover at the connection level" {
 }
 
 test "the accept table only allows the documented transitions" {
-    var operation = acceptor.Operation{};
-    try std.testing.expect(acceptor.transition(&operation, .idle, .posted));
-    try std.testing.expectEqual(acceptor.State.posted, operation.state);
-    try std.testing.expect(!acceptor.transition(&operation, .idle, .posted));
-    try std.testing.expect(acceptor.transition(&operation, .posted, .transit));
-    try std.testing.expectEqual(acceptor.Action.wait_ack, acceptor.actionFor(operation.state));
-    try std.testing.expect(acceptor.transition(&operation, .transit, .idle));
-    try std.testing.expectEqual(acceptor.Action.none, acceptor.actionFor(operation.state));
+    // The core owns the states and no native object, so the whole table is exercised without a
+    // listener, a completion port or an operation record.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    try std.testing.expect(core.transition(0, .idle, .posted));
+    try std.testing.expectEqual(acceptor.State.posted, core.state(0).?);
+    try std.testing.expect(!core.transition(0, .idle, .posted));
+    try std.testing.expect(core.transition(0, .posted, .transit));
+    try std.testing.expectEqual(acceptor.Action.wait_ack, core.actionFor(0));
+    try std.testing.expect(core.transition(0, .transit, .idle));
+    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
     // A posted operation may fall straight back to idle when its AcceptEx was refused or cancelled.
-    try std.testing.expect(acceptor.transition(&operation, .idle, .posted));
-    try std.testing.expect(acceptor.transition(&operation, .posted, .idle));
-    try std.testing.expectEqual(acceptor.Action.none, acceptor.actionFor(operation.state));
-    try std.testing.expectEqual(acceptor.Action.close_posted, acceptor.actionFor(.posted));
-    try std.testing.expect(!acceptor.transition(&operation, .idle, .transit));
+    try std.testing.expect(core.transition(0, .idle, .posted));
+    try std.testing.expect(core.transition(0, .posted, .idle));
+    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
+    // A slot that spent its synchronous attempts yields to a queued repost. It is still live -- the
+    // acceptor may not stop while one is outstanding -- and nothing is posted to cancel.
+    try std.testing.expect(core.transition(0, .idle, .deferred));
+    try std.testing.expectEqual(acceptor.Action.none, core.actionFor(0));
+    try std.testing.expectEqual(@as(u32, 1), core.liveCount());
+    try std.testing.expectEqual(@as(u32, 0), core.postedCount());
+    try std.testing.expect(core.transition(0, .deferred, .idle));
+    try std.testing.expectEqual(@as(u32, 0), core.liveCount());
+    try std.testing.expect(!core.transition(0, .idle, .transit));
+    try std.testing.expect(!core.transition(0, .deferred, .posted));
+    // An index outside the table is refused rather than corrupting a neighbour.
+    try std.testing.expect(!core.transition(9, .idle, .posted));
+    try std.testing.expect(core.state(9) == null);
 }
 
 test "a zero-byte datagram is preserved and a reset recovers the receive depth" {

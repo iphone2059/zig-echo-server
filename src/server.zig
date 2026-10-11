@@ -136,7 +136,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     // reposts, so the acceptor thread only returns once nothing of its own is left in flight.
     if (acceptor_published) acceptor.stop(&acceptor_value);
     acceptor.destroy(&acceptor_value);
-    if (acceptor_value.liveCount() != 0) return reportAndFail("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
+    if (acceptor_value.terminalLive() != 0) return reportAndFail("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
     if (!shutdown.advance(.acceptor_stopped)) return reportAndFail("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
     // Phase two: the admission barrier. The acceptor publishes it as its last act, but a run whose
@@ -148,8 +148,8 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     if (!shutdown.advance(.workers_stopped)) return reportAndFail("TCP shutdown worker order", c.ERROR_INVALID_STATE);
 
     var statistics = types.Statistics{};
-    statistics.rejected +%= acceptor_value.rejected;
-    statistics.network_errors +%= acceptor_value.network_errors +% startup_network_errors;
+    statistics.rejected +%= acceptor_value.core.rejected;
+    statistics.network_errors +%= acceptor_value.core.network_errors +% startup_network_errors;
     var fatal = failed.load(.acquire);
     for (workers[0..initialized]) |*wrk| {
         const running = wrk.thread.value != null;

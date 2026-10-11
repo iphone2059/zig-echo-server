@@ -724,16 +724,6 @@ pub const acceptor = struct {
         return status == 64 or status == types.wsa_econnreset or status == types.wsa_econnaborted;
     }
 
-    pub fn actionFor(state: State) Action {
-        return switch (state) {
-            .idle => .none,
-            .posted => .close_posted,
-            .transit => .wait_ack,
-            // Nothing is posted to cancel: the queued repost packet is already on its way, and
-            // retiring it is what lets the acceptor finish its drain.
-            .deferred => .none,
-        };
-    }
 
     /// Round-robin over the workers that still have a credit. Scanning instead of taking the next
     /// index is what keeps a saturated worker from being handed a socket it would have to refuse.
@@ -756,13 +746,86 @@ pub const acceptor = struct {
     /// repost, matching the reference.
     pub const synchronous_attempts: u32 = 4;
 
+    /// The pure accept state: which slot is posted, who is waiting, and the admission tallies.
+    ///
+    /// It owns no native object, so every transition, the worker rotation and the refusal counting
+    /// are testable without a listener or a completion port.
+    pub const Core = struct {
+        states: []State = &.{},
+        /// Round-robin cursor over the workers.
+        rotation: u32 = 0,
+        stopping: bool = false,
+        /// Connects refused because every worker's credits were already committed.
+        rejected: u64 = 0,
+        /// Refused AcceptEx attempts and accept-socket failures, merged into the run's ledger: a
+        /// reset storm the listener recovers from still has to be visible in network_errors.
+        network_errors: u64 = 0,
+
+        pub fn init(states: []State) Core {
+            @memset(states, .idle);
+            return .{ .states = states };
+        }
+
+        pub fn count(self: *const Core) u32 {
+            return @intCast(self.states.len);
+        }
+
+        pub fn state(self: *const Core, index: u32) ?State {
+            return if (index < self.states.len) self.states[index] else null;
+        }
+
+        /// The only legal accept transitions: idle -> posted -> transit -> idle, where a posted or
+        /// idle slot may also yield to a deferred repost.
+        pub fn transition(self: *Core, index: u32, expected: State, desired: State) bool {
+            if (self.state(index) != expected) return false;
+            const legal = (expected == .idle and (desired == .posted or desired == .deferred)) or
+                (expected == .posted and (desired == .transit or desired == .idle or desired == .deferred)) or
+                (expected == .transit and desired == .idle) or
+                (expected == .deferred and desired == .idle);
+            if (!legal) return false;
+            self.states[index] = desired;
+            return true;
+        }
+
+        pub fn actionFor(self: *const Core, index: u32) Action {
+            return switch (self.state(index) orelse .idle) {
+                .idle => .none,
+                .posted => .close_posted,
+                .transit => .wait_ack,
+                // Nothing is posted to cancel: the queued repost packet is already on its way, and
+                // retiring it is what lets the acceptor finish its drain.
+                .deferred => .none,
+            };
+        }
+
+        pub fn liveCount(self: *const Core) u32 {
+            var total: u32 = 0;
+            for (self.states) |slot_state| {
+                if (slot_state != .idle) total += 1;
+            }
+            return total;
+        }
+
+        pub fn postedCount(self: *const Core) u32 {
+            var total: u32 = 0;
+            for (self.states) |slot_state| {
+                if (slot_state == .posted) total += 1;
+            }
+            return total;
+        }
+
+        pub fn stop(self: *Core) void {
+            self.stopping = true;
+        }
+    };
+
+
     pub const Operation = struct {
         overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
         owner: ?*Acceptor = null,
         socket: c.SOCKET = c.INVALID_SOCKET,
         socket_owner: native.socket.Socket = .{},
         acceptor_port: c.HANDLE = null,
-        state: State = .idle,
         index: u32 = 0,
         addresses: [types.accept_operation_bytes]u8 = @splat(0),
     };
@@ -782,13 +845,13 @@ pub const acceptor = struct {
         workers: []TcpWorker = &.{},
         credits: []AdmissionCredits = &.{},
         failed: ?*std.atomic.Value(bool) = null,
-        rotation: u32 = 0,
-        /// Connects refused because every worker's credits were already committed.
-        rejected: u64 = 0,
-        /// Refused AcceptEx attempts and accept-socket failures, merged into the run's ledger: a
-        /// reset storm the listener recovers from still has to be visible in network_errors.
-        network_errors: u64 = 0,
-        stopping: bool = false,
+        /// Storage for the pure accept state.
+        states: []State = &.{},
+        /// The pure accept state machine: transitions, rotation and the admission tallies.
+        core: Core = .{},
+        /// The slots still live when the acceptor thread returned, recorded before the state storage
+        /// is released so the shutdown barrier can assert the terminal condition afterwards.
+        terminal_live: u32 = 0,
         ready: bool = false,
         startup_ok: bool = false,
 
@@ -803,19 +866,17 @@ pub const acceptor = struct {
         /// Operations that are still posted or in transit; the acceptor must retire all of them
         /// before it can release its listener and its accept table.
         pub fn liveCount(self: *const Acceptor) u32 {
-            var count: u32 = 0;
-            for (self.operations) |operation| {
-                if (operation.state != .idle) count += 1;
-            }
-            return count;
+            return self.core.liveCount();
+        }
+
+        /// Reads the terminal count recorded by destroy. The state storage is gone by then, so this
+        /// is the only way to assert that no accept slot was left behind.
+        pub fn terminalLive(self: *const Acceptor) u32 {
+            return self.terminal_live;
         }
 
         pub fn postedCount(self: *const Acceptor) u32 {
-            var count: u32 = 0;
-            for (self.operations) |operation| {
-                if (operation.state == .posted) count += 1;
-            }
-            return count;
+            return self.core.postedCount();
         }
     };
 
@@ -828,18 +889,6 @@ pub const acceptor = struct {
         native.diagnostics.failFast(stage, native_error);
     }
 
-    /// The only legal accept transitions: idle -> posted -> transit -> idle, and a posted operation
-    /// may fall straight back to idle when its AcceptEx was refused or cancelled.
-    pub fn transition(operation: *Operation, expected: State, desired: State) bool {
-        if (operation.state != expected) return false;
-        const legal = (expected == .idle and (desired == .posted or desired == .deferred)) or
-            (expected == .posted and (desired == .transit or desired == .idle or desired == .deferred)) or
-            (expected == .transit and desired == .idle) or
-            (expected == .deferred and desired == .idle);
-        if (!legal) return false;
-        operation.state = desired;
-        return true;
-    }
 
     fn operationInRange(self: *const Acceptor, operation: *const Operation) bool {
         if (self.operations.len == 0) return false;
@@ -860,16 +909,16 @@ pub const acceptor = struct {
     pub fn postAccept(self: *Acceptor, operation: *Operation) bool {
         var attempt: u32 = 0;
         while (attempt < synchronous_attempts) : (attempt += 1) {
-            if (self.stopping or self.failed.?.load(.acquire) or self.listener.get() == c.INVALID_SOCKET) return true;
+            if (self.core.stopping or self.failed.?.load(.acquire) or self.listener.get() == c.INVALID_SOCKET) return true;
             operation.overlapped = std.mem.zeroes(c.OVERLAPPED);
             operation.socket_owner.reset(native.socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP));
             operation.socket = operation.socket_owner.get();
             if (operation.socket == c.INVALID_SOCKET) {
                 native.diagnostics.report("WSASocketW(accepted RIO socket)", @bitCast(c.WSAGetLastError()));
-                self.network_errors +%= 1;
+                self.core.network_errors +%= 1;
                 return false;
             }
-            if (!transition(operation, .idle, .posted)) {
+            if (!self.core.transition(operation.index, .idle, .posted)) {
                 failFast("accept post state", c.ERROR_INVALID_STATE);
             }
             var received: c.DWORD = 0;
@@ -888,11 +937,11 @@ pub const acceptor = struct {
             // AcceptEx is asynchronous: a pending result is the normal outcome, and only any other
             // refusal means the operation was never queued.
             if (status == @as(i32, @intCast(c.ERROR_IO_PENDING))) return true;
-            _ = transition(operation, .posted, .idle);
+            _ = self.core.transition(operation.index, .posted, .idle);
             closeAccepted(operation);
             // A refused attempt is a network error whether or not it can be retried, exactly as the
             // reference counts it.
-            self.network_errors +%= 1;
+            self.core.network_errors +%= 1;
             if (!acceptErrorIsRecoverable(status)) {
                 native.diagnostics.report("AcceptEx", @bitCast(status));
                 return false;
@@ -900,7 +949,7 @@ pub const acceptor = struct {
         }
         // The synchronous budget is spent. The slot is retried from the loop below rather than here,
         // and the queued packet is what keeps a deferred slot live until it is retired.
-        if (!transition(operation, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
+        if (!self.core.transition(operation.index, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
         if (!native.rio.postCompletion(self.port.get(), @intFromPtr(operation), null)) {
             failFast("PostQueuedCompletionStatus(deferred AcceptEx repost)", c.GetLastError());
         }
@@ -910,8 +959,8 @@ pub const acceptor = struct {
     /// Retires one control packet. A slot that a worker acknowledged or that deferred its repost
     /// returns to idle and is posted again unless the acceptor is stopping.
     fn resumeSlot(self: *Acceptor, operation: *Operation, expected: State) void {
-        if (!transition(operation, expected, .idle)) failFast("accept control state", c.ERROR_INVALID_STATE);
-        if (!self.stopping and !postAccept(self, operation)) {
+        if (!self.core.transition(operation.index, expected, .idle)) failFast("accept control state", c.ERROR_INVALID_STATE);
+        if (!self.core.stopping and !postAccept(self, operation)) {
             failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
         }
     }
@@ -924,13 +973,13 @@ pub const acceptor = struct {
     }
 
     pub fn beginStop(self: *Acceptor) void {
-        if (self.stopping) return;
-        self.stopping = true;
+        if (self.core.stopping) return;
+        self.core.stop();
         self.listener.deinit();
         for (self.operations) |*operation| {
             // Closing the accepted socket cancels its outstanding AcceptEx; the completion is then
             // retired by the loop instead of leaving the operation posted forever.
-            if (actionFor(operation.state) == .close_posted) closeAccepted(operation);
+            if (self.core.actionFor(operation.index) == .close_posted) closeAccepted(operation);
         }
     }
 
@@ -951,9 +1000,9 @@ pub const acceptor = struct {
         const completed = c.WSAGetOverlappedResult(self.listener.get(), &operation.overlapped, &accept_bytes, c.FALSE, &flags);
         if (completed == c.FALSE) completion_error = c.WSAGetLastError();
         if (packet_ok == false and completed == c.FALSE) {
-            if (!transition(operation, .posted, .idle)) failFast("accept completion state", c.ERROR_INVALID_STATE);
+            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept completion state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
-            if (self.stopping) return;
+            if (self.core.stopping) return;
             // A peer that was deleted, reset or aborted between the accept and the completion is a
             // connection-level event: the listener stays healthy and the slot is reused. The repost
             // itself carries the bounded synchronous retry and the deferral.
@@ -967,7 +1016,7 @@ pub const acceptor = struct {
         if (!native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) or
             !native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true))
         {
-            if (!transition(operation, .posted, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
+            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             failAndStop(self, "accepted socket configuration", @intCast(c.WSAGetLastError()));
             return;
@@ -987,24 +1036,24 @@ pub const acceptor = struct {
             &remote_length,
         );
         if (local == null or remote == null or local_length <= 0 or remote_length <= 0) {
-            if (!transition(operation, .posted, .idle)) failFast("accept address state", c.ERROR_INVALID_STATE);
+            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept address state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             failAndStop(self, "GetAcceptExSockaddrs", c.WSAEINVAL);
             return;
         }
         // Round-robin over the workers that still hold a credit: a saturated worker is never handed
         // a socket it would have to refuse.
-        const worker_index = selectWorker(self.credits, &self.rotation, self.workerCount()) orelse {
-            if (!transition(operation, .posted, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
+        const worker_index = selectWorker(self.credits, &self.core.rotation, self.workerCount()) orelse {
+            if (!self.core.transition(operation.index, .posted, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
-            self.rejected +%= 1;
-            if (!transition(operation, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
+            self.core.rejected +%= 1;
+            if (!self.core.transition(operation.index, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
             if (!native.rio.postCompletion(self.port.get(), @intFromPtr(operation), null)) {
                 failFast("PostQueuedCompletionStatus(refused AcceptEx repost)", c.GetLastError());
             }
             return;
         };
-        if (!transition(operation, .posted, .transit)) failFast("accept transit state", c.ERROR_INVALID_STATE);
+        if (!self.core.transition(operation.index, .posted, .transit)) failFast("accept transit state", c.ERROR_INVALID_STATE);
         worker.tcp.postHandoff(&self.workers[worker_index], operation);
     }
 
@@ -1025,7 +1074,7 @@ pub const acceptor = struct {
         }
         publishReady(self, posted);
 
-        while (!self.stopping or self.liveCount() != 0) {
+        while (!self.core.stopping or self.liveCount() != 0) {
             const packet = native.rio.getQueuedCompletionStatus(self.port.get(), 100);
             if (packet.overlapped == null and packet.key == types.stop_key) {
                 beginStop(self);
@@ -1036,7 +1085,7 @@ pub const acceptor = struct {
                 // withdrawing the socket it was handed, or the slot yielded to a deferred repost.
                 const operation: *Operation = @ptrFromInt(packet.key);
                 if (!operationInRange(self, operation)) failFast("accept control identity", c.ERROR_INVALID_DATA);
-                switch (operation.state) {
+                switch (self.core.state(operation.index) orelse .idle) {
                     .transit => resumeSlot(self, operation, .transit),
                     .deferred => resumeSlot(self, operation, .deferred),
                     else => failFast("accept control state", c.ERROR_INVALID_DATA),
@@ -1046,11 +1095,11 @@ pub const acceptor = struct {
 
             if (packet.overlapped != null) {
                 const operation: *Operation = @fieldParentPtr("overlapped", packet.overlapped.?);
-                if (!operationInRange(self, operation) or operation.state != .posted) {
+                if (!operationInRange(self, operation) or self.core.state(operation.index) != .posted) {
                     failFast("AcceptEx completion identity", c.ERROR_INVALID_DATA);
                 }
-                if (!packet.ok and self.stopping) {
-                    if (!transition(operation, .posted, .idle)) failFast("cancelled accept state", c.ERROR_INVALID_STATE);
+                if (!packet.ok and self.core.stopping) {
+                    if (!self.core.transition(operation.index, .posted, .idle)) failFast("cancelled accept state", c.ERROR_INVALID_STATE);
                     closeAccepted(operation);
                 } else {
                     completeAccept(self, operation, packet.ok, packet.native_error);
@@ -1116,6 +1165,11 @@ pub const acceptor = struct {
         self.get_accept_addresses = native.endpoint.acceptAddressesExtension(self.listener.get()) orelse return error.AddressExtension;
 
         const count = operation_count(self.workerCount());
+        self.states = allocator.alloc(State, count) catch {
+            native.diagnostics.report("allocate accept states", c.ERROR_NOT_ENOUGH_MEMORY);
+            return error.Operations;
+        };
+        self.core = Core.init(self.states);
         self.operations = allocator.alloc(Operation, count) catch {
             native.diagnostics.report("allocate accept operations", c.ERROR_NOT_ENOUGH_MEMORY);
             return error.Operations;
@@ -1163,12 +1217,15 @@ pub const acceptor = struct {
         const allocator = std.heap.page_allocator;
         join(self);
         self.thread.deinit();
-        if (self.ready and self.liveCount() != 0) {
-            failFast("acceptor release precondition", c.ERROR_IO_INCOMPLETE);
-        }
+        // Recorded while the storage is still valid. A live slot here means a posted accept or a
+        // published handoff was never retired, which the caller reports rather than crashing on.
+        self.terminal_live = if (self.ready) self.liveCount() else 0;
         for (self.operations) |*operation| closeAccepted(operation);
         if (self.operations.len != 0) allocator.free(self.operations);
         self.operations = &.{};
+        if (self.states.len != 0) allocator.free(self.states);
+        self.states = &.{};
+        self.core.states = &.{};
         self.listener.deinit();
         self.ready_event.deinit();
         self.port.deinit();
