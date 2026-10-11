@@ -1556,11 +1556,25 @@ pub const udp = struct {
 
         /// The runtime armed a slot, so ownership of that one slot moved to the provider. The
         /// per-slot flag and the total move together, which is what makes the pair exact.
-        pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) void {
-            if (index < self.slots.len) {
-                self.slots[index] = .{ .direction = operation, .outstanding = true };
+        ///
+        /// The refusals are what keep that pair exact. An out-of-range index owns no slot, and a slot
+        /// that is already outstanding already owns an operation, so counting either would raise the
+        /// total without a matching slot. A closing engine has no legitimate new post. The provider
+        /// has already accepted the request by the time this is called, so a refusal is an invariant
+        /// failure for the caller to fail fast on rather than an accounting entry to ignore: the
+        /// result reports whether the registration was made, and only a true result licenses the
+        /// caller to continue.
+        pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) bool {
+            if (index >= self.slots.len or
+                self.closing or
+                self.slots[index].outstanding or
+                self.outstanding >= self.slots.len)
+            {
+                return false;
             }
-            self.outstanding +%= 1;
+            self.slots[index] = .{ .direction = operation, .outstanding = true };
+            self.outstanding += 1;
+            return true;
         }
 
         /// A post the runtime attempted and the provider refused. The slot never became outstanding,
@@ -1796,7 +1810,7 @@ pub const udp = struct {
                     failed = true;
                     break;
                 }
-                engine_value.onPosted(index, .receive);
+                native.guards.requireTransition(engine_value.onPosted(index, .receive), "UDP post ownership");
             }
             if (!engine_value.hasWork()) {
                 // The depth could not even be armed once, so nothing can make progress.
@@ -1844,7 +1858,7 @@ pub const udp = struct {
                                         socket_owner.deinit();
                                         continue;
                                     }
-                                    engine_value.onPosted(index, .receive);
+                                    native.guards.requireTransition(engine_value.onPosted(index, .receive), "UDP post ownership");
                                 },
                                 .repost_send => {
                                     // The datagram length is kept exactly, so a zero-byte datagram is
@@ -1858,7 +1872,7 @@ pub const udp = struct {
                                         socket_owner.deinit();
                                         continue;
                                     }
-                                    engine_value.onPosted(index, .send);
+                                    native.guards.requireTransition(engine_value.onPosted(index, .send), "UDP post ownership");
                                 },
                                 .drop => {},
                                 .fatal => {
