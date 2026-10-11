@@ -515,3 +515,36 @@ test "the accept completion decision is pure and total" {
     try std.testing.expect(credits[0].tryReserve());
     try std.testing.expectEqual(@as(?u32, 1), core.reserveWorker(0, &credits));
 }
+test "a deferred repost is consumed before the acceptor shuts down" {
+    // Mirrors deferred_reposts_are_consumed_before_acceptor_shutdown. A slot that yielded to a queued
+    // repost is still live, so the acceptor may not stop while it is outstanding; retiring it under
+    // stop leaves nothing behind rather than arming another post.
+    var states: [1]acceptor.State = undefined;
+    var core = acceptor.Core.init(&states);
+    try std.testing.expect(core.transition(0, .idle, .deferred));
+    try std.testing.expectEqual(@as(u32, 1), core.liveCount());
+    core.stop();
+    try std.testing.expect(core.transition(0, .deferred, .idle));
+    try std.testing.expectEqual(@as(u32, 0), core.liveCount());
+}
+
+test "admission skips full workers and restores released reservations" {
+    // Mirrors admission_skips_full_workers_and_restores_released_reservations. The scan takes the
+    // first worker with a credit from the rotation, so an unequal capacity is walked exactly as the
+    // reference walks it, and a released credit is found again on the next pass.
+    var credits = [_]acceptor.AdmissionCredits{
+        acceptor.AdmissionCredits.init(1),
+        acceptor.AdmissionCredits.init(2),
+    };
+    var rotation: u32 = 0;
+    try std.testing.expectEqual(@as(?u32, 0), acceptor.selectWorker(&credits, &rotation, 2));
+    try std.testing.expectEqual(@as(?u32, 1), acceptor.selectWorker(&credits, &rotation, 2));
+    try std.testing.expectEqual(@as(?u32, 1), acceptor.selectWorker(&credits, &rotation, 2));
+    try std.testing.expectEqual(@as(?u32, null), acceptor.selectWorker(&credits, &rotation, 2));
+    credits[0].release();
+    try std.testing.expectEqual(@as(?u32, 0), acceptor.selectWorker(&credits, &rotation, 2));
+    credits[0].release();
+    credits[1].release();
+    credits[1].release();
+    for (&credits) |*credit| try std.testing.expect(credit.isFull());
+}
