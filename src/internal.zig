@@ -1112,9 +1112,9 @@ pub const acceptor = struct {
                 failFast("unexpected acceptor IOCP packet", c.ERROR_INVALID_DATA);
             }
         }
-        // The admission barrier reaches every worker from the acceptor, so a worker can never wait
-        // for a closed admission that nobody publishes.
-        for (self.workers) |*wrk| worker.tcp.postAdmissionClosed(wrk);
+        // The acceptor publishes nothing on its way out. Admission is the coordinator's barrier:
+        // it owns the transition, it knows which workers actually started, and a worker can never
+        // wait for a closure that nobody publishes because the coordinator always reaches it.
         return if (self.failed.?.load(.acquire)) 1 else 0;
     }
 

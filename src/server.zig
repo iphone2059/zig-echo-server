@@ -109,7 +109,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     var acceptor_published = false;
     var startup_network_errors: u64 = 0;
     if (!failed.load(.acquire)) {
-        acceptor.initialize(&acceptor_value, api, options, workers, credits, &failed) catch {
+        acceptor.initialize(&acceptor_value, api, options, workers[0..initialized], credits[0..initialized], &failed) catch {
             // A listener, bind/listen, IOCP or extension failure is a network error even though no
             // acceptor thread ever started, which is how the reference counts it.
             startup_network_errors +%= 1;
@@ -131,41 +131,47 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     }
 
     var shutdown: ShutdownSequence = .{};
-    // Phase one: the listener stops accepting and every published handoff is reclaimed. Closing the
-    // accept table also cancels the posted AcceptEx operations, and the loop retires the deferred
-    // reposts, so the acceptor thread only returns once nothing of its own is left in flight.
+    // Phase one: stop and join every thread. Nothing in this phase may return early -- a thread still
+    // running while the deferred release below frees its storage, its completion queue and its
+    // registered memory is exactly the dangling ownership this barrier exists to prevent.
     if (acceptor_published) acceptor.stop(&acceptor_value);
     acceptor.destroy(&acceptor_value);
-    if (acceptor_value.terminalLive() != 0) return reportAndFail("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
-    if (!shutdown.advance(.acceptor_stopped)) return reportAndFail("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
+    if (!shutdown.advance(.acceptor_stopped)) native.diagnostics.failFast("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
-    // Phase two: the admission barrier. The acceptor publishes it as its last act, but a run whose
-    // acceptor never started still has to close admission for the workers it did start.
+    // The coordinator owns the admission barrier; the acceptor publishes nothing on its way out. A
+    // run whose acceptor never started still has to close admission for the workers it did start.
     for (workers[0..initialized]) |*wrk| tcp.postAdmissionClosed(wrk);
-    if (!shutdown.advance(.admission_closed)) return reportAndFail("TCP shutdown admission order", c.ERROR_INVALID_STATE);
+    if (!shutdown.advance(.admission_closed)) native.diagnostics.failFast("TCP shutdown admission order", c.ERROR_INVALID_STATE);
 
     for (workers[0..initialized]) |*wrk| tcp.postStop(wrk);
-    if (!shutdown.advance(.workers_stopped)) return reportAndFail("TCP shutdown worker order", c.ERROR_INVALID_STATE);
+    if (!shutdown.advance(.workers_stopped)) native.diagnostics.failFast("TCP shutdown worker order", c.ERROR_INVALID_STATE);
 
     var statistics = types.Statistics{};
     statistics.rejected +%= acceptor_value.core.rejected;
     statistics.network_errors +%= acceptor_value.core.network_errors +% startup_network_errors;
     var fatal = failed.load(.acquire);
+    var undrained_worker = false;
     for (workers[0..initialized]) |*wrk| {
         const running = wrk.thread.value != null;
         tcp.join(wrk);
-        if (running and !wrk.engine_value.mayExit()) {
-            return reportAndFail("TCP worker release precondition", c.ERROR_INVALID_STATE);
-        }
+        // Every thread is stopped now, so the worker's own accounting is quiescent and may be read.
+        if (running and !wrk.engine_value.mayExit()) undrained_worker = true;
         statistics.merge(&wrk.engine_value.statistics);
         if (wrk.engine_value.fatal) fatal = true;
     }
-    if (!shutdown.advance(.joined)) return reportAndFail("TCP shutdown join order", c.ERROR_INVALID_STATE);
-    for (workers[0..initialized]) |*wrk| tcp.destroy(wrk);
+    if (!shutdown.advance(.joined)) native.diagnostics.failFast("TCP shutdown join order", c.ERROR_INVALID_STATE);
 
-    // The admission credits can only be checked here: a live connection holds its credit until the
-    // worker that owns it releases the connection, so checking before the join would report a
-    // healthy server shutting down with active connections as a failure.
+    // Phase two: the ownership invariants, read while nothing is running. A live accept slot, or a
+    // worker that never retired its operations, means Windows can still reach registered memory and
+    // OVERLAPPED records, so releasing them would be a use-after-free. That is a fail-fast, not a
+    // recoverable error that the deferred cleanup could safely carry on from.
+    if (acceptor_value.terminalLive() != 0) {
+        native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
+    }
+    if (undrained_worker) native.diagnostics.failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
+
+    // Phase three: release, then assert the accounting that no longer implies native ownership.
+    for (workers[0..initialized]) |*wrk| tcp.destroy(wrk);
     for (credits) |*credit| {
         if (!credit.isFull()) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
     }
@@ -173,7 +179,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     const outstanding: u32 = 0;
     if (options.stats) {
         var buffer: [512]u8 = undefined;
-        const line = statistics.writeFinalLine(.tcp, native.nowMilliseconds() - start, worker_count, outstanding, &buffer) orelse
+        const line = statistics.writeFinalLine(.tcp, native.nowMilliseconds() - start, initialized, outstanding, &buffer) orelse
             return reportAndFail("format TCP statistics", c.ERROR_INSUFFICIENT_BUFFER);
         if (!native.diagnostics.writeStdout(line)) return reportAndFail("write TCP statistics", c.GetLastError());
     }
