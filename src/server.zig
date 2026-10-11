@@ -107,8 +107,12 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
 
     var acceptor_value: acceptor.Acceptor = .{};
     var acceptor_published = false;
+    var startup_network_errors: u64 = 0;
     if (!failed.load(.acquire)) {
         acceptor.initialize(&acceptor_value, api, options, workers, credits, &failed) catch {
+            // A listener, bind/listen, IOCP or extension failure is a network error even though no
+            // acceptor thread ever started, which is how the reference counts it.
+            startup_network_errors +%= 1;
             failed.store(true, .release);
         };
         if (!failed.load(.acquire)) {
@@ -128,13 +132,11 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
 
     var shutdown: ShutdownSequence = .{};
     // Phase one: the listener stops accepting and every published handoff is reclaimed. Closing the
-    // accept table also cancels the posted AcceptEx operations, which the loop then retires.
+    // accept table also cancels the posted AcceptEx operations, and the loop retires the deferred
+    // reposts, so the acceptor thread only returns once nothing of its own is left in flight.
     if (acceptor_published) acceptor.stop(&acceptor_value);
     acceptor.destroy(&acceptor_value);
     if (acceptor_value.liveCount() != 0) return reportAndFail("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
-    for (credits) |*credit| {
-        if (!credit.isFull()) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
-    }
     if (!shutdown.advance(.acceptor_stopped)) return reportAndFail("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
     // Phase two: the admission barrier. The acceptor publishes it as its last act, but a run whose
@@ -147,6 +149,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
 
     var statistics = types.Statistics{};
     statistics.rejected +%= acceptor_value.rejected;
+    statistics.network_errors +%= acceptor_value.network_errors +% startup_network_errors;
     var fatal = failed.load(.acquire);
     for (workers[0..initialized]) |*wrk| {
         const running = wrk.thread.value != null;
@@ -159,6 +162,13 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     }
     if (!shutdown.advance(.joined)) return reportAndFail("TCP shutdown join order", c.ERROR_INVALID_STATE);
     for (workers[0..initialized]) |*wrk| tcp.destroy(wrk);
+
+    // The admission credits can only be checked here: a live connection holds its credit until the
+    // worker that owns it releases the connection, so checking before the join would report a
+    // healthy server shutting down with active connections as a failure.
+    for (credits) |*credit| {
+        if (!credit.isFull()) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
+    }
 
     const outstanding: u32 = 0;
     if (options.stats) {

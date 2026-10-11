@@ -705,7 +705,14 @@ pub const acceptor = struct {
     /// The bounded accept window: two operations per worker, at least eight and at most 128.
     pub const operation_count = contract.acceptOperationCount;
 
-    pub const State = enum(u8) { idle = 0, posted = 1, transit = 2 };
+    pub const State = enum(u8) {
+        idle = 0,
+        posted = 1,
+        /// The socket was handed to a worker and is waiting to be acknowledged.
+        transit = 2,
+        /// The synchronous reset retries were exhausted, so this slot yielded to a queued repost.
+        deferred = 3,
+    };
 
     /// What the shutdown path must do with one accept operation.
     pub const Action = enum(u8) { none, close_posted, wait_ack };
@@ -722,6 +729,9 @@ pub const acceptor = struct {
             .idle => .none,
             .posted => .close_posted,
             .transit => .wait_ack,
+            // Nothing is posted to cancel: the queued repost packet is already on its way, and
+            // retiring it is what lets the acceptor finish its drain.
+            .deferred => .none,
         };
     }
 
@@ -742,13 +752,9 @@ pub const acceptor = struct {
         return null;
     }
 
-    /// The bounded number of synchronous re-posts before the loop defers the attempt through its
-    /// own completion port.
-    pub const maximum_synchronous_reposts: u32 = 8;
-
-    /// A completion key the acceptor uses to ask its own loop to re-post idle operations later
-    /// instead of spinning on a queue that keeps refusing them.
-    pub const deferred_key: usize = 3;
+    /// The bounded number of synchronous attempts one operation makes before it yields to a queued
+    /// repost, matching the reference.
+    pub const synchronous_attempts: u32 = 4;
 
     pub const Operation = struct {
         overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
@@ -779,8 +785,9 @@ pub const acceptor = struct {
         rotation: u32 = 0,
         /// Connects refused because every worker's credits were already committed.
         rejected: u64 = 0,
-        consecutive_failures: u32 = 0,
-        deferred_pending: bool = false,
+        /// Refused AcceptEx attempts and accept-socket failures, merged into the run's ledger: a
+        /// reset storm the listener recovers from still has to be visible in network_errors.
+        network_errors: u64 = 0,
         stopping: bool = false,
         ready: bool = false,
         startup_ok: bool = false,
@@ -825,9 +832,10 @@ pub const acceptor = struct {
     /// may fall straight back to idle when its AcceptEx was refused or cancelled.
     pub fn transition(operation: *Operation, expected: State, desired: State) bool {
         if (operation.state != expected) return false;
-        const legal = (expected == .idle and desired == .posted) or
-            (expected == .posted and (desired == .transit or desired == .idle)) or
-            (expected == .transit and desired == .idle);
+        const legal = (expected == .idle and (desired == .posted or desired == .deferred)) or
+            (expected == .posted and (desired == .transit or desired == .idle or desired == .deferred)) or
+            (expected == .transit and desired == .idle) or
+            (expected == .deferred and desired == .idle);
         if (!legal) return false;
         operation.state = desired;
         return true;
@@ -846,26 +854,19 @@ pub const acceptor = struct {
         operation.socket = c.INVALID_SOCKET;
     }
 
-    /// Asks the acceptor loop to re-post idle operations later instead of spinning on a queue that
-    /// keeps refusing them.
-    fn deferRetry(self: *Acceptor) void {
-        if (self.deferred_pending) return;
-        self.deferred_pending = true;
-        if (!native.rio.postCompletion(self.port.get(), deferred_key, null)) {
-            failFast("PostQueuedCompletionStatus(deferred accept)", c.GetLastError());
-        }
-    }
-
-    /// Posts one AcceptEx, retrying a bounded number of times when the queue refuses it for a
-    /// connection-level reason and deferring through the completion port once the bound is reached.
+    /// Posts one AcceptEx. A connection-level refusal is retried synchronously a bounded number of
+    /// times; once those are spent the slot yields to a queued repost packet instead of spinning on
+    /// a queue that keeps refusing it.
     pub fn postAccept(self: *Acceptor, operation: *Operation) bool {
         var attempt: u32 = 0;
-        while (attempt <= maximum_synchronous_reposts) : (attempt += 1) {
+        while (attempt < synchronous_attempts) : (attempt += 1) {
+            if (self.stopping or self.failed.?.load(.acquire) or self.listener.get() == c.INVALID_SOCKET) return true;
             operation.overlapped = std.mem.zeroes(c.OVERLAPPED);
             operation.socket_owner.reset(native.socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP));
             operation.socket = operation.socket_owner.get();
             if (operation.socket == c.INVALID_SOCKET) {
                 native.diagnostics.report("WSASocketW(accepted RIO socket)", @bitCast(c.WSAGetLastError()));
+                self.network_errors +%= 1;
                 return false;
             }
             if (!transition(operation, .idle, .posted)) {
@@ -882,43 +883,39 @@ pub const acceptor = struct {
                 &received,
                 &operation.overlapped,
             );
+            if (accepted != c.FALSE) return true;
+            const status = c.WSAGetLastError();
             // AcceptEx is asynchronous: a pending result is the normal outcome, and only any other
             // refusal means the operation was never queued.
-            if (accepted != c.FALSE) {
-                self.consecutive_failures = 0;
-                return true;
-            }
-            const status = c.WSAGetLastError();
-            if (status == @as(i32, @intCast(c.ERROR_IO_PENDING))) {
-                self.consecutive_failures = 0;
-                return true;
-            }
+            if (status == @as(i32, @intCast(c.ERROR_IO_PENDING))) return true;
             _ = transition(operation, .posted, .idle);
             closeAccepted(operation);
+            // A refused attempt is a network error whether or not it can be retried, exactly as the
+            // reference counts it.
+            self.network_errors +%= 1;
             if (!acceptErrorIsRecoverable(status)) {
                 native.diagnostics.report("AcceptEx", @bitCast(status));
                 return false;
             }
-            self.consecutive_failures +%= 1;
-            if (self.consecutive_failures > maximum_synchronous_reposts) {
-                deferRetry(self);
-                self.consecutive_failures = 0;
-                return true;
-            }
         }
-        return false;
+        // The synchronous budget is spent. The slot is retried from the loop below rather than here,
+        // and the queued packet is what keeps a deferred slot live until it is retired.
+        if (!transition(operation, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
+        if (!native.rio.postCompletion(self.port.get(), @intFromPtr(operation), null)) {
+            failFast("PostQueuedCompletionStatus(deferred AcceptEx repost)", c.GetLastError());
+        }
+        return true;
     }
 
-    fn repostIdle(self: *Acceptor) void {
-        for (self.operations) |*operation| {
-            if (operation.state != .idle) continue;
-            if (self.stopping) continue;
-            if (!postAccept(self, operation)) {
-                native.diagnostics.report("AcceptEx deferred repost", @intCast(c.WSAGetLastError()));
-                break;
-            }
+    /// Retires one control packet. A slot that a worker acknowledged or that deferred its repost
+    /// returns to idle and is posted again unless the acceptor is stopping.
+    fn resumeSlot(self: *Acceptor, operation: *Operation, expected: State) void {
+        if (!transition(operation, expected, .idle)) failFast("accept control state", c.ERROR_INVALID_STATE);
+        if (!self.stopping and !postAccept(self, operation)) {
+            failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
         }
     }
+
 
     fn failAndStop(self: *Acceptor, stage: []const u8, native_error: u32) void {
         native.diagnostics.report(stage, native_error);
@@ -958,9 +955,10 @@ pub const acceptor = struct {
             closeAccepted(operation);
             if (self.stopping) return;
             // A peer that was deleted, reset or aborted between the accept and the completion is a
-            // connection-level event: the listener stays healthy and the operation is re-posted.
+            // connection-level event: the listener stays healthy and the slot is reused. The repost
+            // itself carries the bounded synchronous retry and the deferral.
             if (acceptErrorIsRecoverable(completion_error)) {
-                deferRetry(self);
+                if (!postAccept(self, operation)) failAndStop(self, "AcceptEx repost", @bitCast(completion_error));
                 return;
             }
             failAndStop(self, "AcceptEx completion", @bitCast(completion_error));
@@ -1000,7 +998,10 @@ pub const acceptor = struct {
             if (!transition(operation, .posted, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             self.rejected +%= 1;
-            deferRetry(self);
+            if (!transition(operation, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
+            if (!native.rio.postCompletion(self.port.get(), @intFromPtr(operation), null)) {
+                failFast("PostQueuedCompletionStatus(refused AcceptEx repost)", c.GetLastError());
+            }
             return;
         };
         if (!transition(operation, .posted, .transit)) failFast("accept transit state", c.ERROR_INVALID_STATE);
@@ -1030,23 +1031,19 @@ pub const acceptor = struct {
                 beginStop(self);
                 continue;
             }
-            if (packet.overlapped == null and packet.key == deferred_key) {
-                self.deferred_pending = false;
-                if (!self.stopping) repostIdle(self);
-                continue;
-            }
-            if (packet.overlapped == null and packet.key > deferred_key) {
-                // A worker finished adopting (or withdrawing) the socket it was handed.
+            if (packet.overlapped == null and packet.key > types.admission_closed_key) {
+                // One queued control packet per accept slot: either a worker finished adopting or
+                // withdrawing the socket it was handed, or the slot yielded to a deferred repost.
                 const operation: *Operation = @ptrFromInt(packet.key);
-                if (!operationInRange(self, operation) or operation.state != .transit) {
-                    failFast("accept acknowledgement identity", c.ERROR_INVALID_DATA);
-                }
-                if (!transition(operation, .transit, .idle)) failFast("accept acknowledgement state", c.ERROR_INVALID_STATE);
-                if (!self.stopping and !postAccept(self, operation)) {
-                    failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
+                if (!operationInRange(self, operation)) failFast("accept control identity", c.ERROR_INVALID_DATA);
+                switch (operation.state) {
+                    .transit => resumeSlot(self, operation, .transit),
+                    .deferred => resumeSlot(self, operation, .deferred),
+                    else => failFast("accept control state", c.ERROR_INVALID_DATA),
                 }
                 continue;
             }
+
             if (packet.overlapped != null) {
                 const operation: *Operation = @fieldParentPtr("overlapped", packet.overlapped.?);
                 if (!operationInRange(self, operation) or operation.state != .posted) {

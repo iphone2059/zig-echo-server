@@ -158,6 +158,13 @@ try {
     try { Test-TcpClosed -Tcp $second -Stage 'TCP idle connection' }
     finally { $second.Dispose() }
 
+    # A connection that is still established when the run deadline expires is exactly the case the
+    # shutdown barrier has to survive: its admission credit only comes home once the worker that
+    # owns it releases the connection, which cannot happen before the join. Checking the credits any
+    # earlier would report a healthy server as failed.
+    $held = New-TestTcpClient -Port $tcpPort
+    Test-SplitEcho -Tcp $held -Payload ([Text.Encoding]::ASCII.GetBytes('held-across-shutdown'))
+
     $stormReady = Join-Path $scratch 'storm.ready.txt'
     $stormCount = Join-Path $scratch 'storm.count.txt'
     $stormScript = Join-Path $PSScriptRoot 'tcp_storm.ps1'
@@ -177,6 +184,9 @@ try {
     # The driver reports the full shutdown barrier, so a terminal state that only looks idle is not
     # enough: the RIO requests and the published handoffs have to be retired as well.
     if ($tcpOutput -notmatch '^tcp_driver active=0 outstanding=0 handoffs=0 failed=false\r?\n?$') { throw "TCP acceptor terminal state mismatch: $tcpOutput" }
+
+    # The held connection was open across the whole barrier and the driver still retired it cleanly.
+    $held.Dispose()
 
     $serverProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'udp', '/s', $port, '/w', '3', '/k', '64', '/cq', '256', '/memory', '67108864', '/q', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     Start-Sleep -Milliseconds 350
