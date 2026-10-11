@@ -63,11 +63,33 @@ function Invoke-PinnedZig {
 }
 
 Invoke-PinnedZig -Arguments @('build', '-Dtarget=x86_64-windows-msvc', "-Doptimize=$Optimize")
-# Both modes install to the same zig-out\bin, so the mode is frozen beside the binary the moment it
-# is built. A benchmark that reads the path instead of this marker cannot tell Debug from ReleaseFast.
-$markerDirectory = Join-Path $PSScriptRoot 'zig-out\bin'
-New-Item -ItemType Directory -Force -Path $markerDirectory | Out-Null
-Set-Content -LiteralPath (Join-Path $markerDirectory 'optimize-mode.txt') -Value $Optimize -Encoding ascii
 if (-not $BuildOnly) {
     Invoke-PinnedZig -Arguments @('build', 'test', '-Dtarget=x86_64-windows-msvc', "-Doptimize=$Optimize")
 }
+
+# Both modes install into the same zig-out\bin, so the identity of what was built is frozen beside
+# the binaries the moment the build finishes: mode, source commit, compiler, build arguments and the
+# hash of every installed executable. A benchmark that reads the path instead of this manifest cannot
+# tell a Debug build from a ReleaseFast one, and cannot notice a binary replaced afterwards.
+$binaryDirectory = Join-Path $PSScriptRoot 'zig-out\bin'
+New-Item -ItemType Directory -Force -Path $binaryDirectory | Out-Null
+$installedHashes = [ordered]@{}
+foreach ($installed in Get-ChildItem -LiteralPath $binaryDirectory -Filter '*.exe' -File | Sort-Object Name) {
+    $installedHashes[$installed.Name] = (Get-FileHash -LiteralPath $installed.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$sourceCommit = $null
+try { $sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD 2>$null | Out-String).Trim() } catch { $sourceCommit = $null }
+if ($sourceCommit -cnotmatch '^[0-9a-f]{40}$') { $sourceCommit = $null }
+$buildManifest = [ordered]@{
+    project = 'zig-echo-server'
+    optimize_mode = $Optimize
+    target = 'x86_64-windows-msvc'
+    source_commit = $sourceCommit
+    zig_version = $actualVersion
+    zig_path = $resolvedZig
+    build_arguments = @('build', '-Dtarget=x86_64-windows-msvc', "-Doptimize=$Optimize")
+    binaries = $installedHashes
+}
+$buildManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $binaryDirectory 'build-manifest.json') -Encoding utf8
+if ($sourceCommit) { Set-Content -LiteralPath (Join-Path $binaryDirectory 'source-commit.txt') -Value $sourceCommit -Encoding ascii }
+

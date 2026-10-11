@@ -53,7 +53,9 @@ function New-ServerArguments {
 }
 
 function Test-BenchmarkRun {
-    param([Parameter(Mandatory=$true)][pscustomobject]$Run, [AllowNull()][pscustomobject]$StopRecord)
+    param([Parameter(Mandatory=$true)][pscustomobject]$Run, [AllowNull()][pscustomobject]$StopRecord,
+        # A formal performance gate must prove the mode, not merely recognise it.
+        [string]$RequiredOptimizeMode = 'ReleaseFast')
     $required=@('exit_code','elapsed_ms','echoed','expected_echo_count','bytes','expected_bytes','lost',
         'corrupted','network_errors','server_sha256','expected_server_sha256','server_path',
         'expected_server_path','server_pid','server_alive_after_run','stderr_length','optimize_mode')
@@ -70,6 +72,7 @@ function Test-BenchmarkRun {
         -not [string]::Equals($Run.server_sha256,$Run.expected_server_sha256,[StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals([IO.Path]::GetFullPath($Run.server_path),[IO.Path]::GetFullPath($Run.expected_server_path),[StringComparison]::OrdinalIgnoreCase)) { return $false }
     if ($Run.optimize_mode -cnotin @('Debug', 'ReleaseFast')) { return $false }
+    if ($RequiredOptimizeMode -cne '' -and $Run.optimize_mode -cne $RequiredOptimizeMode) { return $false }
     if ($StopRecord.protocol -ceq 'tcp') {
         return $StopRecord.terminal_line -match '^final protocol=tcp\b.*\bactive=0\b' -and
             $StopRecord.worker_count -gt 0 -and $StopRecord.worker_count -eq $StopRecord.zero_workers
@@ -80,20 +83,75 @@ function Test-BenchmarkRun {
     return $false
 }
 
+function Get-ExecutableBuildManifest {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    $manifestPath = Join-Path $directory 'build-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "executable build manifest missing: $manifestPath"
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($manifest.optimize_mode -cnotin @('Debug', 'ReleaseFast')) {
+        throw "invalid optimize mode in build manifest: $manifestPath"
+    }
+    if ($null -eq $manifest.binaries) { throw "build manifest records no binaries: $manifestPath" }
+    return $manifest
+}
+
+# A marker beside the executable only proves what the build intended. The manifest records the hash of
+# every installed binary as well, so an executable swapped in afterwards is refused rather than
+# measured under an identity it does not have.
+function Assert-ExecutableIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$RequiredOptimizeMode = ''
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    $manifest = Get-ExecutableBuildManifest -Path $full
+    $name = Split-Path -Leaf $full
+    $recorded = $manifest.binaries.PSObject.Properties[$name]
+    if ($null -eq $recorded) { throw "executable is not recorded in the build manifest: $name" }
+    $observed = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+    if (-not [string]::Equals($observed, [string]$recorded.Value, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "executable does not match its build manifest: $full"
+    }
+    if ($RequiredOptimizeMode -cne '' -and $manifest.optimize_mode -cne $RequiredOptimizeMode) {
+        throw "executable was built as $($manifest.optimize_mode); $RequiredOptimizeMode is required for this gate"
+    }
+    return $manifest
+}
+
 function Get-ExecutableOptimizeMode {
     param([Parameter(Mandatory = $true)][string]$Path, [switch]$AllowUnknown)
 
-    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
-    $marker = Join-Path $directory 'optimize-mode.txt'
-    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+    try { return (Get-ExecutableBuildManifest -Path $Path).optimize_mode }
+    catch {
         if ($AllowUnknown) { return $null }
-        throw "executable optimize mode marker missing: $marker"
+        throw
     }
-    $mode = (Get-Content -LiteralPath $marker -Raw).Trim()
-    # An unknown mode is rejected rather than carried into a result. Both build modes install to the
-    # same zig-out\bin, so a benchmark that cannot say which build it measured is not a measurement.
-    if ($mode -cnotin @('Debug', 'ReleaseFast')) { throw "invalid executable optimize mode marker: $marker" }
-    return $mode
+}
+
+function Get-WorkloadTotals {
+    param([Parameter(Mandatory = $true)][pscustomobject]$Case)
+
+    # /n is the per-session echo quota and /c is the session count, so a complete finite load is
+    # echo_count * sessions echoes and that many payload bytes. Deriving the total from echo_count
+    # alone rejects a run that did exactly what it was asked to do.
+    foreach ($field in @('echo_count', 'sessions', 'payload_bytes')) {
+        if ($null -eq $Case.PSObject.Properties[$field]) { throw "benchmark case lacks $field" }
+    }
+    $perSession = [long]$Case.echo_count
+    $sessions = [long]$Case.sessions
+    $payload = [long]$Case.payload_bytes
+    if ($perSession -lt 1 -or $sessions -lt 1 -or $payload -lt 1) { throw 'benchmark case totals require positive values' }
+    return [pscustomobject]@{
+        per_session_echoes = $perSession
+        sessions = $sessions
+        echoes = $perSession * $sessions
+        bytes = $perSession * $sessions * $payload
+    }
 }
 
 function Get-ExecutableCommit {

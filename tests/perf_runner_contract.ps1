@@ -73,23 +73,51 @@ $described=& $runner -ServerPath 'missing-server.exe' -ServerPid 0 -ServerArgume
 Assert-True (($described.client_arguments -contains '/n') -and -not ($described.client_arguments -contains '/w')) 'describe-only client command invalid'
 Assert-True (-not (Test-Path -LiteralPath $output)) 'describe-only created output directory'
 
+$totals = Get-WorkloadTotals -Case ([pscustomobject]@{ echo_count = 17; sessions = 8; payload_bytes = 128 })
+Assert-True ($totals.echoes -eq 136) 'per-session echo quota was not multiplied by the session count'
+Assert-True ($totals.bytes -eq 17408) 'expected bytes ignored the session count'
+$single = Get-WorkloadTotals -Case ([pscustomobject]@{ echo_count = 17; sessions = 1; payload_bytes = 128 })
+Assert-True ($single.echoes -eq 17 -and $single.bytes -eq 2176) 'single-session totals changed'
+
+# A formal gate must prove the mode, not merely recognise a known one.
+$debugRun = $run.PSObject.Copy(); $debugRun.optimize_mode = 'Debug'
+Assert-True (-not (Test-BenchmarkRun -Run $debugRun -StopRecord $stop)) 'Debug run satisfied the ReleaseFast gate'
+Assert-True (Test-BenchmarkRun -Run $debugRun -StopRecord $stop -RequiredOptimizeMode '') 'unrequired mode rejected'
+
 $modeFixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('perf-mode-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $modeFixtureDirectory
 $modeFixtureExe = Join-Path $modeFixtureDirectory 'frozen.exe'
-$modeMarker = Join-Path $modeFixtureDirectory 'optimize-mode.txt'
+$modeManifest = Join-Path $modeFixtureDirectory 'build-manifest.json'
 try {
+    Set-Content -LiteralPath $modeFixtureExe -Value 'binary' -Encoding ascii
     $missingModeRejected = $false
     try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $missingModeRejected = $true }
-    Assert-True $missingModeRejected 'missing optimize mode marker was accepted'
+    Assert-True $missingModeRejected 'missing build manifest was accepted'
     Assert-True ($null -eq (Get-ExecutableOptimizeMode -Path $modeFixtureExe -AllowUnknown)) 'unknown peer mode was invented'
-    Set-Content -LiteralPath $modeMarker -Value 'ReleaseFast' -Encoding ascii
-    Assert-True ((Get-ExecutableOptimizeMode -Path $modeFixtureExe) -ceq 'ReleaseFast') 'frozen ReleaseFast marker was ignored'
-    Set-Content -LiteralPath $modeMarker -Value 'ReleaseSafe' -Encoding ascii
+
+    $fixtureHash = (Get-FileHash -LiteralPath $modeFixtureExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $modeFixtureManifest = [ordered]@{ optimize_mode = 'Debug'; binaries = [ordered]@{ 'frozen.exe' = $fixtureHash } }
+    $modeFixtureManifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $modeManifest -Encoding utf8
+    Assert-True ((Get-ExecutableOptimizeMode -Path $modeFixtureExe) -ceq 'Debug') 'frozen manifest mode was ignored'
+
+    # A binary swapped in after the build must not inherit the manifest's identity.
+    Set-Content -LiteralPath $modeFixtureExe -Value 'replaced' -Encoding ascii
+    $replacedRejected = $false
+    try { $null = Assert-ExecutableIdentity -Path $modeFixtureExe } catch { $replacedRejected = $true }
+    Assert-True $replacedRejected 'replaced executable inherited the manifest identity'
+
+    Set-Content -LiteralPath $modeFixtureExe -Value 'binary' -Encoding ascii
+    $debugRejected = $false
+    try { $null = Assert-ExecutableIdentity -Path $modeFixtureExe -RequiredOptimizeMode 'ReleaseFast' } catch { $debugRejected = $true }
+    Assert-True $debugRejected 'Debug executable satisfied a ReleaseFast gate'
+
+    Set-Content -LiteralPath $modeManifest -Value '{"optimize_mode":"ReleaseSafe","binaries":{"frozen.exe":"x"}}' -Encoding ascii
     $unknownModeRejected = $false
     try { $null = Get-ExecutableOptimizeMode -Path $modeFixtureExe } catch { $unknownModeRejected = $true }
     Assert-True $unknownModeRejected 'unknown optimize mode was accepted'
 } finally {
-    if (Test-Path -LiteralPath $modeMarker) { Remove-Item -LiteralPath $modeMarker }
+    if (Test-Path -LiteralPath $modeManifest) { Remove-Item -LiteralPath $modeManifest }
+    if (Test-Path -LiteralPath $modeFixtureExe) { Remove-Item -LiteralPath $modeFixtureExe }
     Remove-Item -LiteralPath $modeFixtureDirectory
 }
 

@@ -11,6 +11,8 @@ param(
     [string]$HostAddress='127.0.0.1',
     [long]$EchoCountOverride=0,
     [switch]$Pilot,
+    # Formal performance data must come from the mode it claims; '' disables the requirement.
+    [string]$RequireOptimizeMode = 'ReleaseFast',
     [switch]$DescribeOnly
 )
 $ErrorActionPreference='Stop'
@@ -36,7 +38,10 @@ $serverExe=(Resolve-Path -LiteralPath $ServerPath -ErrorAction Stop).Path
 $clientExe=(Resolve-Path -LiteralPath $ClientPath -ErrorAction Stop).Path
 $serverCommit=Get-ExecutableCommit -Path $serverExe
 $clientCommit=Get-ExecutableCommit -Path $clientExe
-$serverOptimizeMode=Get-ExecutableOptimizeMode -Path $serverExe
+# The measured binary is proven against its build manifest before the run starts, so a binary swapped
+# in after the build is refused rather than measured under the old identity.
+$serverManifest=Assert-ExecutableIdentity -Path $serverExe -RequiredOptimizeMode $RequireOptimizeMode
+$serverOptimizeMode=$serverManifest.optimize_mode
 $clientOptimizeMode=Get-ExecutableOptimizeMode -Path $clientExe -AllowUnknown
 $serverProcess=Get-Process -Id $ServerPid -ErrorAction Stop
 try {
@@ -87,13 +92,14 @@ if ($null -ne $serverProcess) {
     finally { $serverProcess.Dispose() }
 }
 $observedServerHash=(Get-FileHash -LiteralPath $serverExe -Algorithm SHA256).Hash.ToLowerInvariant()
-$expectedBytes=[long]$workload.echo_count * [long]$workload.payload_bytes
+$totals=Get-WorkloadTotals -Case $workload
+$expectedBytes=$totals.bytes
 $benchLine=@(($stdout -split "`r?`n") | Where-Object { $_ -match '^bench_latency_sample=batch ' } | Select-Object -Last 1)
 $run=[pscustomobject]@{
     case=$workload; exit_code=$exitCode; elapsed_ms=[long]$timer.ElapsedMilliseconds
     process_cpu_ms=$cpuMilliseconds; timed_out=$timedOut; pilot=[bool]$Pilot
     echoed=if ($fields.ContainsKey('echoed')) { [long]$fields.echoed } else { -1 }
-    expected_echo_count=[long]$workload.echo_count
+    expected_echo_count=$totals.echoes
     bytes=if ($fields.ContainsKey('bytes')) { [long]$fields.bytes } else { -1 }
     expected_bytes=$expectedBytes
     lost=if ($fields.ContainsKey('lost')) { [long]$fields.lost } else { -1 }
@@ -107,15 +113,17 @@ $run=[pscustomobject]@{
     server_path=$serverExe; expected_server_path=$serverExe; client_path=$clientExe; server_pid=$ServerPid
     server_commit=$serverCommit; client_commit=$clientCommit
     optimize_mode=$serverOptimizeMode; client_optimize_mode=$clientOptimizeMode
+    manifest_source_commit=$serverManifest.source_commit; manifest_zig_version=$serverManifest.zig_version
     server_arguments=$ServerArguments; client_arguments=$clientArguments; host_address=$HostAddress
     zig_version=(& 'C:\bin\zig-x86_64-windows-0.17.0-dev.2375+d8aab4878\zig.exe' version | Out-String).Trim()
     windows_version=[Environment]::OSVersion.VersionString
     processor=@(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name -Unique)
     stdout_path=$stdoutPath; stderr_path=$stderrPath
 }
+$modeValid=$RequireOptimizeMode -ceq '' -or $run.optimize_mode -ceq $RequireOptimizeMode
 $correctnessValid=$run.exit_code -eq 0 -and $run.echoed -eq $run.expected_echo_count -and
     $run.bytes -eq $run.expected_bytes -and $run.lost -eq 0 -and $run.corrupted -eq 0 -and
-    $run.network_errors -eq 0 -and $run.stderr_length -eq 0 -and $run.server_alive_after_run -and
+    $run.network_errors -eq 0 -and $run.stderr_length -eq 0 -and $run.server_alive_after_run -and $modeValid -and
     [string]::Equals($run.server_sha256,$run.expected_server_sha256,[StringComparison]::OrdinalIgnoreCase)
 $run | Add-Member -NotePropertyName correctness_valid -NotePropertyValue $correctnessValid
 $run | Add-Member -NotePropertyName provisional_valid -NotePropertyValue ($correctnessValid -and $run.elapsed_ms -ge 10000)
