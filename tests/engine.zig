@@ -548,3 +548,30 @@ test "admission skips full workers and restores released reservations" {
     credits[1].release();
     for (&credits) |*credit| try std.testing.expect(credit.isFull());
 }
+test "a zero length datagram is echoed as a zero length send" {
+    // Mirrors a_zero_length_datagram_is_echoed_as_a_zero_length_send. A completed receive always
+    // echoes, including a datagram that carried nothing, and the length it echoes is exactly the
+    // length it received.
+    var directions: [1]types.EngineOperation = undefined;
+    var engine_value = udp.Engine.init(&directions);
+    engine_value.onPosted(0, .receive);
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 0, 65_507));
+    try std.testing.expectEqual(@as(u32, 0), udp.receiveLength(0, 65_507));
+}
+
+test "a connection reset returns the slot to receiving without counting a send" {
+    // Mirrors a_connection_reset_returns_the_slot_to_receiving. The socket survives an ICMP
+    // port-unreachable: a reset send is a completion but not traffic, so it is not reported as a send
+    // and carries no bytes, while the receive that preceded it still counts.
+    var directions: [1]types.EngineOperation = undefined;
+    var engine_value = udp.Engine.init(&directions);
+    engine_value.onPosted(0, .receive);
+    try std.testing.expectEqual(udp.Action.repost_send, engine_value.onCompletion(.receive, types.error_success, 0, 65_507));
+    engine_value.onPosted(0, .send);
+    try std.testing.expectEqual(types.EngineOperation.send, engine_value.direction(0));
+    try std.testing.expectEqual(udp.Action.repost_receive, engine_value.onCompletion(.send, types.wsa_econnreset, 0, 65_507));
+    try std.testing.expect(!engine_value.closing);
+    try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sends);
+    try std.testing.expectEqual(@as(u64, 0), engine_value.statistics.sent_bytes);
+    try std.testing.expectEqual(@as(u64, 1), engine_value.statistics.receives);
+}
