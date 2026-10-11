@@ -188,6 +188,35 @@ try {
     # The held connection was open across the whole barrier and the driver still retired it cleanly.
     $held.Dispose()
 
+    # The stop boundary over real threads: a slot already published to a worker must survive the stop,
+    # because the acceptor no longer owns that socket. The driver leaves the worker thread idle so the
+    # handoff stays in transit and the boundary can be measured rather than raced.
+    $stopOwnershipDriver = Join-Path (Split-Path -Parent $server) 'zig-echo-server-tcp-stop-ownership-driver.exe'
+    if (-not (Test-Path -LiteralPath $stopOwnershipDriver -PathType Leaf)) { throw "Missing TCP stop-ownership driver: $stopOwnershipDriver" }
+    $ownershipStdout = Join-Path $scratch 'ownership.stdout.txt'
+    $ownershipStderr = Join-Path $scratch 'ownership.stderr.txt'
+    $ownershipPort = Get-FreeTcpPort
+    $ownershipProcess = Start-Process -FilePath $stopOwnershipDriver -ArgumentList @(8, $ownershipPort) -NoNewWindow -PassThru -RedirectStandardOutput $ownershipStdout -RedirectStandardError $ownershipStderr
+    if (-not $ownershipProcess.WaitForExit(60000)) { throw 'TCP stop-ownership driver did not converge.' }
+    if ($ownershipProcess.ExitCode -ne 0) { throw "TCP stop-ownership driver failed with exit code $($ownershipProcess.ExitCode): $(Get-Content -Raw $ownershipStderr)" }
+    $ownershipError = Get-Content -Raw -LiteralPath $ownershipStderr
+    $ownershipOutput = Get-Content -Raw -LiteralPath $ownershipStdout
+    if ($ownershipError.Length -ne 0) { throw "Successful TCP stop-ownership driver wrote to stderr: $ownershipError" }
+    # transit_rounds must be non-zero or the run proved nothing: the boundary is only exercised when a
+    # handoff was actually published before the stop. closed_transit_sockets is the assertion itself.
+    if ($ownershipOutput -notmatch '^stop_ownership rounds=\d+ transit_rounds=(\d+) closed_transit_sockets=0 connect_failures=\d+ claimed=(\d+) available=(\d+) capacity=(\d+) credit_mismatch=0 failed=false\r?\n?$') {
+        throw "TCP stop-ownership terminal state mismatch: $ownershipOutput"
+    }
+    if ([int]$Matches[1] -le 0) { throw "TCP stop-ownership driver never observed a transiting handoff: $ownershipOutput" }
+    # The capturable fields are transit_rounds, claimed, available and capacity. Every observed transit
+    # handoff leaves exactly one reservation unclaimed, because no worker thread ever consumes it, so
+    # capacity - available must be exactly the number of transit rounds.
+    if (([int]$Matches[4] - [int]$Matches[3]) -ne [int]$Matches[1]) { throw "TCP stop-ownership credit accounting is inconsistent: $ownershipOutput" }
+    if ([int]$Matches[2] -ne [int]$Matches[1]) { throw "TCP stop-ownership claimed count does not match the transit count: $ownershipOutput" }
+    # Every transit round leaves one reservation unclaimed, because no worker thread consumes it. The
+    # three captures above are transit_rounds, claimed and capacity; the arithmetic is the assertion.
+    if ([int]$Matches[2] -ne [int]$Matches[1]) { throw "TCP stop-ownership claimed count does not match the transit count: $ownershipOutput" }
+
     $serverProcess = Start-Process -FilePath $server -ArgumentList @('/p', 'udp', '/s', $port, '/w', '3', '/k', '64', '/cq', '256', '/memory', '67108864', '/q', '/stats') -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     Start-Sleep -Milliseconds 350
     if ($serverProcess.HasExited) {

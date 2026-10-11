@@ -573,8 +573,8 @@ test "a failed completion under stop stays out of the network ledger" {
     var live_core = acceptor.Core.init(&running);
     live_core.worker_count = 1;
     try std.testing.expect(live_core.transition(0, .idle, .posted));
-    const failed = live_core.onCompletion(0, false, types.error_not_enough_memory);
-    try std.testing.expectEqual(types.error_not_enough_memory, failed.fail.code);
+    const fatal = live_core.onCompletion(0, false, types.error_not_enough_memory);
+    try std.testing.expectEqual(types.error_not_enough_memory, fatal.fail.code);
     try std.testing.expect(acceptor.acceptorCountsFailure(live_core.stopping, false));
 }
 

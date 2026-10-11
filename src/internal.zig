@@ -722,7 +722,14 @@ pub const acceptor = struct {
         /// True when every credit has been returned, which is the terminal condition the shutdown
         /// barrier waits for.
         pub fn isFull(self: *const AdmissionCredits) bool {
-            return self.available.load(.acquire) == self.capacity;
+            return self.get() == self.capacity;
+        }
+
+        /// Credits not handed out. Admission never releases more than it reserved, so this never
+        /// exceeds the capacity; a test that observes it can tell a returned reservation from a
+        /// double release.
+        pub fn get(self: *const AdmissionCredits) u32 {
+            return self.available.load(.acquire);
         }
     };
 
@@ -1008,6 +1015,21 @@ pub const acceptor = struct {
             return @intCast(self.operations.len);
         }
 
+        /// What the shutdown path would do with one slot right now.
+        ///
+        /// Exposed so a test can observe the boundary this acceptor actually draws while the stop is
+        /// running, instead of inferring it from the outcome: a slot reported as wait_ack is one the
+        /// stop must leave to the worker that is adopting it.
+        pub fn disposition(self: *const Acceptor, index: u32) SlotDisposition {
+            return self.core.dispositionFor(index);
+        }
+
+        /// True once the stop has begun unpublishing admission, which is the point after which the
+        /// slot boundary above is the one in force.
+        pub fn stopping(self: *const Acceptor) bool {
+            return self.core.stopping;
+        }
+
         /// Operations that are still posted or in transit; the acceptor must retire all of them
         /// before it can release its listener and its accept table.
         pub fn liveCount(self: *const Acceptor) u32 {
@@ -1117,17 +1139,25 @@ pub const acceptor = struct {
         beginStop(self);
     }
 
+    /// Unposts admission: the listener goes away and every posted AcceptEx is cancelled.
+    ///
+    /// Only a posted slot is closed. A slot in transit has already been published to a worker, and
+    /// the acceptor is no longer the owner of that socket -- the worker takes it, or withdraws it and
+    /// acknowledges. Closing it here would race the worker's take() on the same ownership record and
+    /// pull a live socket out from under a handoff that is about to be adopted, which is the same
+    /// WSAENOTSOCK this file just stopped producing. A deferred slot has no AcceptEx to cancel.
+    ///
+    /// Both references draw the boundary in exactly this place: the acceptor's stop only closes
+    /// posted slots, while the unconditional sweep over every slot belongs to the release path,
+    /// which runs after the thread is joined and no completion is outstanding.
     pub fn beginStop(self: *Acceptor) void {
         if (self.core.stopping) return;
         self.core.stop();
         self.listener.deinit();
         for (self.operations) |*operation| {
             // Closing the accepted socket cancels its outstanding AcceptEx; the completion is then
-            // retired by the loop instead of leaving the operation posted forever. The close is
-            // unconditional and idempotent: a slot that is not posted owns nothing, and a posted slot
-            // may still be closed under a completion that arrives after this point -- which is exactly
-            // why the handoff path has to be able to withdraw. Both references close every slot here.
-            closeAccepted(operation);
+            // retired by the loop instead of leaving the operation posted forever.
+            if (self.core.dispositionFor(operation.index) == .close_posted) closeAccepted(operation);
         }
     }
 
