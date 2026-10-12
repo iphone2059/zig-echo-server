@@ -35,6 +35,14 @@ pub const Step = union(enum) {
 
 pub const InitError = error{ Capacity, Allocation, TimerHeap };
 
+pub const Event = union(enum) {
+    completion: struct { value: types.Completion, now: u64 },
+    post_failed: u32,
+    timeout: u64,
+    stop: u64,
+    admission_closed,
+};
+
 /// The bounded number of steps one decision can emit: one per connection slot.
 pub fn stepCapacity(slot_count: u32) usize {
     return slot_count;
@@ -60,6 +68,8 @@ pub const TcpEngine = struct {
     /// Set when a deadline could not be scheduled. Dropping a deadline would turn a timeout into a
     /// hang, so the worker fails fast instead.
     fatal: bool = false,
+    failure: ?types.Failure = null,
+    current_time: u64 = 0,
 
     pub fn init(slot_count: u32, timeout_milliseconds: u64) InitError!TcpEngine {
         if (slot_count == 0) return error.Capacity;
@@ -87,6 +97,29 @@ pub const TcpEngine = struct {
 
     pub fn slotCount(self: *const TcpEngine) u32 {
         return @intCast(self.connections.len);
+    }
+
+    pub fn onEvent(self: *TcpEngine, event: Event, steps: []Step) []const Step {
+        const decision: ?Step = switch (event) {
+            .completion => |value| self.onCompletion(value.value.index, value.value.operation, value.value.status, value.value.bytes, value.now),
+            .post_failed => |index| self.onPostFailure(index),
+            .timeout => |now| return self.onTimeout(now, steps),
+            .stop => |now| return self.beginStopAt(now, steps),
+            .admission_closed => {
+                self.closeAdmission();
+                return steps[0..0];
+            },
+        };
+        if (decision) |step| {
+            if (steps.len == 0) {
+                self.fatal = true;
+                self.failure = types.Failure.invariant("worker action capacity");
+                return steps[0..0];
+            }
+            steps[0] = step;
+            return steps[0..1];
+        }
+        return steps[0..0];
     }
 
     pub fn freeCount(self: *const TcpEngine) u32 {
@@ -144,6 +177,7 @@ pub const TcpEngine = struct {
 
     /// Adopts a taken slot and arms its first receive.
     pub fn admit(self: *TcpEngine, index: u32, now: u64) ?Step {
+        self.current_time = now;
         if (index >= self.connections.len) {
             self.fatal = true;
             return null;
@@ -167,6 +201,7 @@ pub const TcpEngine = struct {
         bytes: u32,
         now: u64,
     ) ?Step {
+        self.current_time = now;
         if (index >= self.connections.len) {
             self.fatal = true;
             return null;
@@ -220,16 +255,13 @@ pub const TcpEngine = struct {
     /// only be closed; this is the baseline's "a failed post is a session failure, not a process
     /// failure" rule.
     pub fn onPostFailure(self: *TcpEngine, index: u32) ?Step {
+        if (index >= self.connections.len or self.rio_outstanding == 0 or self.connections[index].outstanding == 0) {
+            self.fatal = true;
+            self.failure = types.Failure.invariant("worker refused post ownership");
+            return null;
+        }
         self.statistics.network_errors +%= 1;
-        if (self.rio_outstanding == 0) {
-            self.fatal = true;
-            return null;
-        }
         self.rio_outstanding -= 1;
-        if (index >= self.connections.len) {
-            self.fatal = true;
-            return null;
-        }
         const connection = &self.connections[index];
         // The step that asked for this post already counted the operation, but RIO never queued it,
         // so the count has to come back down before the close.
@@ -240,6 +272,7 @@ pub const TcpEngine = struct {
     /// Closes every connection whose deadline passed. The releases that were possible immediately
     /// are returned here; the rest arrive with their completions.
     pub fn onTimeout(self: *TcpEngine, now: u64, steps: []Step) []const Step {
+        self.current_time = now;
         var count: usize = 0;
         while (self.timers.popExpired(now)) |index| {
             if (index >= self.connections.len) {
@@ -247,7 +280,14 @@ pub const TcpEngine = struct {
                 continue;
             }
             const connection = &self.connections[index];
-            if (!connection.isActive() or connection.isClosing()) continue;
+            if (connection.isClosing()) {
+                if (connection.outstanding != 0) {
+                    self.fatal = true;
+                    self.failure = .{ .stage = "TCP connection drain deadline", .code = types.error_timeout, .domain = .invariant, .classification = .internal };
+                }
+                continue;
+            }
+            if (!connection.isActive()) continue;
             if (self.apply(index, connection.close())) |step| {
                 if (count < steps.len) {
                     steps[count] = step;
@@ -261,6 +301,11 @@ pub const TcpEngine = struct {
     /// Closes admission for this worker: no new socket is adopted and every live connection starts
     /// closing.
     pub fn beginStop(self: *TcpEngine, steps: []Step) []const Step {
+        return self.beginStopAt(self.current_time, steps);
+    }
+
+    pub fn beginStopAt(self: *TcpEngine, now: u64, steps: []Step) []const Step {
+        self.current_time = now;
         var count: usize = 0;
         if (self.stopping) return steps[0..0];
         self.stopping = true;
@@ -341,7 +386,8 @@ pub const TcpEngine = struct {
                 } };
             },
             .close => {
-                _ = self.timers.remove(index);
+                connection.deadline = self.current_time +| types.drain_milliseconds;
+                self.schedule(index, connection.deadline);
                 return .{ .close = index };
             },
             .close_and_release => {
@@ -518,7 +564,6 @@ test "the final line matches the worker counters" {
     var buffer: [512]u8 = undefined;
     const line = engine_value.statistics.writeFinalLine(.tcp, 1_000, 1, engine_value.outstanding(), &buffer).?;
     var expected: [512]u8 = undefined;
-    const expected_text = try std.fmt.bufPrint(&expected,
-        "final protocol=tcp elapsed_ms=1000 workers=1 accepted=1 active=0 outstanding=1 completions=2 receives=1 sends=1 received_bytes=16 sent_bytes=16 bytes=16 network_errors=0 rejected=0 MiB_per_sec=0.00\n", .{});
+    const expected_text = try std.fmt.bufPrint(&expected, "final protocol=tcp elapsed_ms=1000 workers=1 accepted=1 active=0 outstanding=1 completions=2 receives=1 sends=1 received_bytes=16 sent_bytes=16 bytes=16 network_errors=0 rejected=0 MiB_per_sec=0.00\n", .{});
     try std.testing.expectEqualStrings(expected_text, line);
 }

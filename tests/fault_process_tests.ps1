@@ -36,7 +36,9 @@ try {
         $output = Get-Content -Raw -LiteralPath $stdout
         $errorOutput = Get-Content -Raw -LiteralPath $stderr
         if ($output.Length -ne 0) { throw "$mode unexpectedly wrote stdout: $output" }
-        if (-not $errorOutput.Contains($expected[$mode]) -or $errorOutput -notmatch 'native_error=\d+') { throw "$mode stderr mismatch: $errorOutput" }
+        # The status is a signed decimal, as the C++ %d and the Rust {} both print it, so a negative
+        # Win32 status is in scope; the boundary name and a numeric payload are what must be present.
+        if (-not $errorOutput.Contains($expected[$mode]) -or $errorOutput -notmatch 'native_error=-?\d+') { throw "$mode stderr mismatch: $errorOutput" }
     }
 
     # The acceptor case is also an ordering proof, not just an exit code. Its state array lives on the

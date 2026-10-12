@@ -52,6 +52,7 @@ pub const sdk = struct {
         pub const ERROR_ARITHMETIC_OVERFLOW: DWORD = 534;
         pub const ERROR_IO_INCOMPLETE: DWORD = 996;
         pub const ERROR_IO_PENDING: DWORD = 997;
+        pub const ERROR_TIMEOUT: DWORD = 1460;
         pub const ERROR_INVALID_STATE: DWORD = 5023;
         pub const WAIT_TIMEOUT: DWORD = 258;
         pub const WAIT_OBJECT_0: DWORD = 0;
@@ -230,6 +231,8 @@ pub const sdk = struct {
         pub extern fn TerminateProcess(process: HANDLE, exit_code: u32) callconv(.winapi) BOOL;
         pub extern fn GetStdHandle(which: DWORD) callconv(.winapi) HANDLE;
         pub extern fn WriteFile(handle: HANDLE, buffer: [*]const u8, bytes: DWORD, written: *DWORD, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+        pub extern fn GetEnvironmentVariableW(name: [*:0]const u16, buffer: ?[*]u16, size: DWORD) callconv(.winapi) DWORD;
+        pub extern fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, security: ?*anyopaque, creation: DWORD, attributes: DWORD, template: HANDLE) callconv(.winapi) HANDLE;
         pub extern fn CloseHandle(handle: HANDLE) callconv(.winapi) BOOL;
         pub extern fn VirtualAlloc(address: ?*anyopaque, bytes: usize, allocation_type: DWORD, protection: DWORD) callconv(.winapi) ?*anyopaque;
         pub extern fn VirtualFree(address: ?*anyopaque, bytes: usize, free_type: DWORD) callconv(.winapi) BOOL;
@@ -270,6 +273,18 @@ pub const sdk = struct {
 
 const c = sdk.c;
 
+pub fn Result(comptime T: type) type {
+    return union(enum) { value: T, failure: types.Failure };
+}
+
+pub fn win32Failure(stage: []const u8) types.Failure {
+    return .{ .stage = stage, .code = @bitCast(c.GetLastError()), .domain = .win32 };
+}
+
+pub fn winsockFailure(stage: []const u8) types.Failure {
+    return .{ .stage = stage, .code = c.WSAGetLastError(), .domain = .winsock };
+}
+
 /// Console and error reporting, plus the process-level fail-fast policy.
 pub const diagnostics = struct {
     fn writeAll(handle_value: c.HANDLE, bytes: []const u8) bool {
@@ -294,8 +309,31 @@ pub const diagnostics = struct {
 
     pub fn report(stage: []const u8, native_error: u32) void {
         var buffer: [512]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, native_error }) catch return;
+        const code: i32 = @bitCast(native_error);
+        const text = std.fmt.bufPrint(&buffer, "{s} failed: native_error={d}\n", .{ stage, code }) catch return;
         _ = writeStderr(text);
+    }
+
+    pub fn reportFailure(failure: types.Failure) void {
+        report(failure.stage, @bitCast(failure.code));
+    }
+
+    /// Runs after the ownership barrier. Diagnostics never alter standard streams or exit status.
+    pub fn writeSnapshots(values: []const types.NotifySnapshot, protocol: types.Protocol) void {
+        const name = [13:0]u16{ 'C', 'E', 'S', '_', 'D', 'I', 'A', 'G', '_', 'F', 'I', 'L', 'E' };
+        const required = c.GetEnvironmentVariableW(&name, null, 0);
+        if (required == 0 or required > 512) return;
+        var path: [512:0]u16 = @splat(0);
+        const length = c.GetEnvironmentVariableW(&name, &path, 512);
+        if (length == 0 or length >= 512) return;
+        const file = c.CreateFileW(&path, 0x40000000, 1, null, 2, 0x80, null);
+        if (file == null or file == c.INVALID_HANDLE_VALUE) return;
+        defer _ = c.CloseHandle(file);
+        for (values) |snapshot| {
+            var buffer: [256]u8 = undefined;
+            const line = snapshot.writeLine(protocol, &buffer) orelse continue;
+            if (!writeAll(file, line)) break;
+        }
     }
 
     /// A failure that leaves the process unable to make progress. The reference terminates rather
@@ -335,9 +373,17 @@ pub const winsock = struct {
         started: bool = false,
 
         pub fn init() !Winsock {
+            return switch (initResult()) {
+                .value => |value| value,
+                .failure => error.WsaStartup,
+            };
+        }
+
+        pub fn initResult() Result(Winsock) {
             var data: c.WSADATA = undefined;
-            if (c.WSAStartup(0x0202, &data) != 0) return error.WsaStartup;
-            return .{ .started = true };
+            const status = c.WSAStartup(0x0202, &data);
+            if (status != 0) return .{ .failure = .{ .stage = "WSAStartup", .code = status } };
+            return .{ .value = .{ .started = true } };
         }
 
         pub fn deinit(self: *Winsock) void {
@@ -464,9 +510,16 @@ pub const arena = struct {
         pointer: ?*anyopaque = null,
 
         pub fn alloc(byte_count: usize) !VirtualMemory {
+            return switch (allocResult(byte_count)) {
+                .value => |value| value,
+                .failure => error.VirtualAlloc,
+            };
+        }
+
+        pub fn allocResult(byte_count: usize) Result(VirtualMemory) {
             const base = c.VirtualAlloc(null, byte_count, c.MEM_RESERVE | c.MEM_COMMIT, c.PAGE_READWRITE);
-            if (base == null) return error.VirtualAlloc;
-            return .{ .pointer = base };
+            if (base == null) return .{ .failure = win32Failure("VirtualAlloc(arena)") };
+            return .{ .value = .{ .pointer = base } };
         }
 
         pub fn bytes(self: *VirtualMemory) [*]u8 {
@@ -516,32 +569,48 @@ pub const arena = struct {
         registrations: []rio.Registration = &.{},
 
         pub fn create(api: *const rio.Api, slots: u32, stride: u32) CreateError!Arena {
-            if (slots == 0 or stride == 0) return error.Capacity;
-            const bytes = types.checkedProduct(u64, slots, stride) orelse return error.Capacity;
-            if (bytes > std.math.maxInt(u32)) return error.Capacity;
-            var pages = try VirtualMemory.alloc(@intCast(bytes));
-            errdefer pages.deinit();
-            const registrations = allocator.alloc(rio.Registration, slots) catch return error.Allocation;
+            return switch (createResult(api, slots, stride)) {
+                .value => |value| value,
+                .failure => |failure| if (failure.domain == .winsock) error.Registration else error.Allocation,
+            };
+        }
+
+        pub fn createResult(api: *const rio.Api, slots: u32, stride: u32) Result(Arena) {
+            const bytes = types.checkedProduct(u64, slots, stride) orelse 0;
+            if (slots == 0 or stride == 0 or bytes == 0 or bytes > std.math.maxInt(u32)) {
+                return .{ .failure = .{ .stage = "arena size", .code = types.error_invalid_data, .domain = .invariant, .classification = .usage } };
+            }
+            var pages = switch (VirtualMemory.allocResult(@intCast(bytes))) {
+                .value => |value| value,
+                .failure => |failure| return .{ .failure = failure },
+            };
+            var transferred = false;
+            defer if (!transferred) pages.deinit();
+            const registrations = allocator.alloc(rio.Registration, slots) catch
+                return .{ .failure = .{ .stage = "allocate arena registrations", .code = types.error_not_enough_memory, .domain = .allocation } };
             var registered: u32 = 0;
-            errdefer {
-                for (registrations[0..registered]) |*registration| registration.deinit();
-                allocator.free(registrations);
+            defer {
+                if (!transferred) {
+                    for (registrations[0..registered]) |*registration| registration.deinit();
+                    allocator.free(registrations);
+                }
             }
             const base = pages.bytes();
             for (0..slots) |slot| {
                 const start: usize = slot * stride;
                 registrations[slot] = .{};
                 registrations[slot].reset(api, api.registerBuffer(base + start, stride));
-                if (!registrations[slot].valid()) return error.Registration;
+                if (!registrations[slot].valid()) return .{ .failure = winsockFailure("RIORegisterBuffer") };
                 registered += 1;
             }
-            return .{
+            transferred = true;
+            return .{ .value = .{
                 .pages = pages,
                 .bytes = @intCast(bytes),
                 .stride = stride,
                 .slots = slots,
                 .registrations = registrations,
-            };
+            } };
         }
 
         /// Deregisters every slot while its memory is still mapped, and only then releases the
@@ -594,11 +663,20 @@ pub const rio = struct {
         /// The extension table is fetched once per run through WSAIoctl. Windows offers no static
         /// address for these entry points, so this cost is inherent and is paid exactly once.
         pub fn load() !Api {
+            return switch (loadResult()) {
+                .value => |value| value,
+                .failure => |failure| {
+                    diagnostics.reportFailure(failure);
+                    return error.LoadRio;
+                },
+            };
+        }
+
+        pub fn loadResult() Result(Api) {
             var probe = socket.Socket{ .value = socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP) };
             defer probe.deinit();
             if (probe.value == c.INVALID_SOCKET) {
-                diagnostics.report("WSASocketW(RIO probe)", @intCast(c.WSAGetLastError()));
-                return error.ProbeSocket;
+                return .{ .failure = winsockFailure("WSASocketW(RIO probe)") };
             }
             var table: c.RIO_EXTENSION_FUNCTION_TABLE = std.mem.zeroes(c.RIO_EXTENSION_FUNCTION_TABLE);
             table.cbSize = @intCast(@sizeOf(c.RIO_EXTENSION_FUNCTION_TABLE));
@@ -616,11 +694,10 @@ pub const rio = struct {
                 null,
             );
             if (status != 0) {
-                diagnostics.report("SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)", @intCast(c.WSAGetLastError()));
-                return error.LoadRio;
+                return .{ .failure = winsockFailure("SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER(RIO)") };
             }
-            if (!tableComplete(&table)) return error.InvalidRioTable;
-            return .{ .table = table };
+            if (!tableComplete(&table)) return .{ .failure = .{ .stage = "RIO extension table", .code = types.error_invalid_data } };
+            return .{ .value = .{ .table = table } };
         }
 
         pub inline fn registerBuffer(self: *const Api, pointer: [*]u8, bytes: u32) c.RIO_BUFFERID {
@@ -777,6 +854,7 @@ pub const rio = struct {
         native_error: u32,
         key: usize,
         overlapped: ?*c.OVERLAPPED,
+        transferred: u32 = 0,
     };
 
     pub fn getQueuedCompletionStatus(port: c.HANDLE, wait_milliseconds: u32) CompletionPacket {
@@ -788,6 +866,7 @@ pub const rio = struct {
             .ok = ok != c.FALSE,
             .native_error = if (ok == c.FALSE) c.GetLastError() else c.ERROR_SUCCESS,
             .key = key,
+            .transferred = transferred,
             .overlapped = if (overlapped) |value| @ptrCast(value) else null,
         };
     }
@@ -809,20 +888,34 @@ pub const endpoint = struct {
     }
 
     pub fn bindEndpoint(socket_value: c.SOCKET, port: u16) bool {
-        var address = anyEndpoint(port);
-        if (c.bind(socket_value, @ptrCast(&address), @sizeOf(c.SOCKADDR_IN)) != 0) {
-            diagnostics.report("bind", @intCast(c.WSAGetLastError()));
+        if (bindFailure(socket_value, port)) |failure| {
+            diagnostics.reportFailure(failure);
             return false;
         }
         return true;
     }
 
+    pub fn bindFailure(socket_value: c.SOCKET, port: u16) ?types.Failure {
+        var address = anyEndpoint(port);
+        if (c.bind(socket_value, @ptrCast(&address), @sizeOf(c.SOCKADDR_IN)) != 0) {
+            return winsockFailure("bind");
+        }
+        return null;
+    }
+
     pub fn listenEndpoint(socket_value: c.SOCKET) bool {
-        if (c.listen(socket_value, c.SOMAXCONN) != 0) {
-            diagnostics.report("listen", @intCast(c.WSAGetLastError()));
+        if (listenFailure(socket_value)) |failure| {
+            diagnostics.reportFailure(failure);
             return false;
         }
         return true;
+    }
+
+    pub fn listenFailure(socket_value: c.SOCKET) ?types.Failure {
+        if (c.listen(socket_value, c.SOMAXCONN) != 0) {
+            return winsockFailure("listen");
+        }
+        return null;
     }
 
     /// An accepted socket only becomes usable for RIO once the accept context has been updated;
@@ -836,6 +929,16 @@ pub const endpoint = struct {
     }
 
     fn loadExtension(comptime T: type, socket_value: c.SOCKET, identifier_value: c.GUID, stage: []const u8) ?T {
+        return switch (loadExtensionResult(T, socket_value, identifier_value, stage)) {
+            .value => |value| value,
+            .failure => |failure| {
+                diagnostics.reportFailure(failure);
+                return null;
+            },
+        };
+    }
+
+    fn loadExtensionResult(comptime T: type, socket_value: c.SOCKET, identifier_value: c.GUID, stage: []const u8) Result(T) {
         var identifier = identifier_value;
         var function: ?T = null;
         var returned: c.DWORD = 0;
@@ -850,18 +953,26 @@ pub const endpoint = struct {
             null,
             null,
         ) != 0) {
-            diagnostics.report(stage, @intCast(c.WSAGetLastError()));
-            return null;
+            return .{ .failure = winsockFailure(stage) };
         }
-        return function;
+        const loaded = function orelse return .{ .failure = .{ .stage = stage, .code = types.error_invalid_data } };
+        return .{ .value = loaded };
     }
 
     pub fn acceptExtension(listener: c.SOCKET) ?c.LPFN_ACCEPTEX {
         return loadExtension(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "load AcceptEx");
     }
 
+    pub fn acceptExtensionResult(listener: c.SOCKET) Result(c.LPFN_ACCEPTEX) {
+        return loadExtensionResult(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "load AcceptEx");
+    }
+
     pub fn acceptAddressesExtension(listener: c.SOCKET) ?c.LPFN_GETACCEPTEXSOCKADDRS {
         return loadExtension(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs");
+    }
+
+    pub fn acceptAddressesExtensionResult(listener: c.SOCKET) Result(c.LPFN_GETACCEPTEXSOCKADDRS) {
+        return loadExtensionResult(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs");
     }
 };
 

@@ -285,6 +285,8 @@ pub const worker = struct {
         }
     };
 
+    pub const ProviderRequest = struct { operation: ?types.EngineOperation = null, length: u32 = 0 };
+
     /// The TCP worker runtime: the loop that translates the pure engine's steps into RIO calls and
     /// back. Every native failure is either contained to one connection or is a process-level fault;
     /// nothing in between is silently ignored.
@@ -292,7 +294,15 @@ pub const worker = struct {
         pub const Worker = TcpWorker;
 
         pub const InitError = error{
-            Port, ReadyEvent, Capacity, Arena, SlotOwners, RequestQueues, Steps, Engine, CompletionQueue,
+            Port,
+            ReadyEvent,
+            Capacity,
+            Arena,
+            SlotOwners,
+            RequestQueues,
+            Steps,
+            Engine,
+            CompletionQueue,
         };
 
         fn failFast(stage: []const u8, native_error: u32) noreturn {
@@ -321,6 +331,7 @@ pub const worker = struct {
             wrk.notification_overlapped = std.mem.zeroes(c.OVERLAPPED);
             native.guards.requireNotifySuccess(wrk.api.?.notify(wrk.completion_queue.value), "RIONotify(worker)");
             native.guards.requireTransition(contract.notificationMarkRearmed(&wrk.completion_queue.armed), "notification rearm transition");
+            wrk.engine_value.notification_armed = wrk.completion_queue.armed;
             wrk.notification_arms +%= 1;
         }
 
@@ -334,6 +345,7 @@ pub const worker = struct {
 
         fn postReceive(wrk: *Worker, index: u32, deadline: u64) bool {
             _ = deadline;
+            if (index >= wrk.provider_requests.len or wrk.provider_requests[index].operation != null) failFast("worker post ownership", c.ERROR_INVALID_DATA);
             const stride = wrk.stride();
             var buffer = wrk.arena.view(index, 0, stride) orelse {
                 native.diagnostics.report("worker receive window", c.ERROR_INVALID_DATA);
@@ -344,15 +356,19 @@ pub const worker = struct {
                 native.diagnostics.report("worker receive queue", c.ERROR_INVALID_STATE);
                 return false;
             }
+            const submitted_length = buffer.Length;
             if (!wrk.api.?.receive(rq, &buffer, 0, @ptrFromInt(context.encode(index, .receive)))) {
                 native.diagnostics.report("RIOReceive", @bitCast(c.WSAGetLastError()));
                 return false;
             }
+            wrk.provider_requests[index] = .{ .operation = .receive, .length = submitted_length };
+            wrk.provider_outstanding += 1;
             return true;
         }
 
         fn postSend(wrk: *Worker, index: u32, offset: u32, length: u32, deadline: u64) bool {
             _ = deadline;
+            if (index >= wrk.provider_requests.len or wrk.provider_requests[index].operation != null) failFast("worker post ownership", c.ERROR_INVALID_DATA);
             var buffer = wrk.arena.view(index, offset, length) orelse {
                 native.diagnostics.report("worker send window", c.ERROR_INVALID_DATA);
                 return false;
@@ -362,10 +378,13 @@ pub const worker = struct {
                 native.diagnostics.report("worker send queue", c.ERROR_INVALID_STATE);
                 return false;
             }
+            const submitted_length = buffer.Length;
             if (!wrk.api.?.send(rq, &buffer, 0, @ptrFromInt(context.encode(index, .send)))) {
                 native.diagnostics.report("RIOSend", @bitCast(c.WSAGetLastError()));
                 return false;
             }
+            wrk.provider_requests[index] = .{ .operation = .send, .length = submitted_length };
+            wrk.provider_outstanding += 1;
             return true;
         }
 
@@ -388,23 +407,35 @@ pub const worker = struct {
         }
 
         fn executeAll(wrk: *Worker, steps: []const engine.Step) void {
+            if (wrk.engine_value.fatal) {
+                if (wrk.engine_value.failure) |failure| failFast(failure.stage, @bitCast(failure.code));
+                failFast("worker engine invariant", c.ERROR_INVALID_DATA);
+            }
             for (steps) |step| {
-                if (execute(wrk, step)) continue;
-                const next = wrk.engine_value.onPostFailure(step.index()) orelse continue;
-                _ = execute(wrk, next);
+                if (execute(wrk, step)) {
+                    maybeArm(wrk);
+                    continue;
+                }
+                var failure_steps: [1]engine.Step = undefined;
+                const next = wrk.engine_value.onEvent(.{ .post_failed = step.index() }, &failure_steps);
+                if (wrk.engine_value.fatal) failFast("worker refused post ownership", c.ERROR_INVALID_DATA);
+                for (next) |value| _ = execute(wrk, value);
             }
         }
 
-        fn drain(wrk: *Worker) void {
+        fn drain(wrk: *Worker, batch_budget: u32, record_budget: u32) void {
             var results: [types.completion_batch_size]c.RIORESULT = undefined;
             var batches: u32 = 0;
-            while (batches < types.completion_drain_batches) : (batches += 1) {
+            var remaining = record_budget;
+            while (batches < batch_budget and remaining != 0) : (batches += 1) {
+                const requested = @min(types.completion_batch_size, remaining);
                 const count = native.guards.requireDequeueCount(
-                    wrk.api.?.dequeue(wrk.completion_queue.value, &results, types.completion_batch_size),
-                    types.completion_batch_size,
+                    wrk.api.?.dequeue(wrk.completion_queue.value, &results, requested),
+                    requested,
                     "RIODequeueCompletion(worker)",
                 );
                 if (count == 0) return;
+                remaining -= count;
                 for (results[0..count]) |result| processResult(wrk, result);
             }
         }
@@ -413,18 +444,26 @@ pub const worker = struct {
             const raw = result.RequestContext orelse failFast("worker null RequestContext", c.ERROR_INVALID_DATA);
             const decoded = context.decode(@intFromPtr(raw), wrk.engine_value.slotCount()) orelse
                 failFast("worker RIO RequestContext", c.ERROR_INVALID_DATA);
-            const now = native.nowMilliseconds();
-            const step = wrk.engine_value.onCompletion(decoded.index, decoded.operation, result.Status, result.BytesTransferred, now);
-            if (wrk.engine_value.fatal) {
-                wrk.failed.?.store(true, .release);
-                stopNow(wrk);
-                return;
+            if (decoded.index >= wrk.provider_requests.len or wrk.provider_outstanding == 0 or
+                wrk.provider_requests[decoded.index].operation == null or wrk.provider_requests[decoded.index].operation.? != decoded.operation or
+                wrk.provider_outstanding != wrk.engine_value.outstanding())
+            {
+                failFast("worker completion invariant", c.ERROR_INVALID_DATA);
             }
-            if (step) |value| executeAll(wrk, &[_]engine.Step{value});
+            if (result.BytesTransferred > wrk.provider_requests[decoded.index].length) failFast("worker completion payload extent", c.ERROR_INVALID_DATA);
+            wrk.provider_requests[decoded.index] = .{};
+            wrk.provider_outstanding -= 1;
+            const now = native.nowMilliseconds();
+            const decisions = wrk.engine_value.onEvent(.{ .completion = .{ .value = .{ .index = decoded.index, .operation = decoded.operation, .status = result.Status, .bytes = result.BytesTransferred }, .now = now } }, wrk.steps);
+            if (wrk.engine_value.fatal) {
+                failFast("worker engine invariant", c.ERROR_INVALID_DATA);
+            }
+            executeAll(wrk, decisions);
         }
 
         fn stopNow(wrk: *Worker) void {
-            const closing = wrk.engine_value.beginStop(wrk.steps);
+            if (wrk.drain_started == null) wrk.drain_started = native.nowMilliseconds();
+            const closing = wrk.engine_value.onEvent(.{ .stop = native.nowMilliseconds() }, wrk.steps);
             executeAll(wrk, closing);
             maybeArm(wrk);
             if (wrk.engine_value.fatal) wrk.failed.?.store(true, .release);
@@ -459,6 +498,7 @@ pub const worker = struct {
                 wrk.credits.?.release();
                 owner.deinit();
                 acknowledge(operation);
+                if (!wrk.engine_value.stopping) failFast("admission credit/free pool mismatch", c.ERROR_INVALID_STATE);
                 return;
             };
             wrk.connection_sockets[index].reset(owner.take());
@@ -473,6 +513,7 @@ pub const worker = struct {
                 null,
             );
             if (rq == c.RIO_INVALID_RQ) {
+                wrk.engine_value.statistics.network_errors +%= 1;
                 native.diagnostics.report("RIOCreateRequestQueue(TCP)", @bitCast(c.WSAGetLastError()));
                 wrk.engine_value.returnSlot(index);
                 wrk.credits.?.release();
@@ -490,7 +531,6 @@ pub const worker = struct {
             };
             // Adoption consumes the reservation the acceptor already took; the credit comes back
             // only when this connection is released.
-            maybeArm(wrk);
             executeAll(wrk, &[_]engine.Step{admit_step});
             acknowledge(operation);
         }
@@ -504,48 +544,69 @@ pub const worker = struct {
             slot_count: u32,
             credits: *acceptor.AdmissionCredits,
         ) InitError!void {
+            switch (initializeResult(wrk, api, options, failed, worker_index, slot_count, credits)) {
+                .value => {},
+                .failure => |failure| {
+                    native.diagnostics.reportFailure(failure);
+                    return error.Engine;
+                },
+            }
+        }
+
+        pub fn initializeResult(
+            wrk: *Worker,
+            api: *const native.rio.Api,
+            options: *const types.Options,
+            failed: *std.atomic.Value(bool),
+            worker_index: u32,
+            slot_count: u32,
+            credits: *acceptor.AdmissionCredits,
+        ) native.Result(void) {
             const allocator = std.heap.page_allocator;
             wrk.* = .{};
-            errdefer destroy(wrk);
+            var initialized = false;
+            defer if (!initialized) destroy(wrk);
             wrk.api = api;
             wrk.options = options;
             wrk.failed = failed;
             wrk.worker_index = worker_index;
             wrk.credits = credits;
-            if (slot_count == 0) return error.Capacity;
+            if (slot_count == 0) return .{ .failure = .{ .stage = "worker registered arena capacity", .code = types.error_not_enough_memory, .domain = .allocation } };
 
             wrk.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
             if (wrk.port.value == null or wrk.port.value == c.INVALID_HANDLE_VALUE) {
-                native.diagnostics.report("CreateIoCompletionPort(worker)", c.GetLastError());
-                return error.Port;
+                return .{ .failure = native.win32Failure("CreateIoCompletionPort(worker)") };
             }
             wrk.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
             if (wrk.ready_event.value == null) {
-                native.diagnostics.report("CreateEvent(worker)", c.GetLastError());
-                return error.ReadyEvent;
+                return .{ .failure = native.win32Failure("CreateEvent(worker)") };
             }
             const stride = native.arena.tcpStride(options.rio_buffer_bytes);
-            wrk.arena = native.arena.Arena.create(api, slot_count, stride) catch |failure| {
-                native.diagnostics.report("worker registered arena", c.ERROR_NOT_ENOUGH_MEMORY);
-                return switch (failure) {
-                    error.Capacity => error.Capacity,
-                    error.Allocation => error.Capacity,
-                    error.VirtualAlloc => error.Arena,
-                    error.Registration => error.Arena,
-                };
+            wrk.arena = switch (native.arena.Arena.createResult(api, slot_count, stride)) {
+                .value => |value| value,
+                .failure => |failure| {
+                    return .{ .failure = failure };
+                },
             };
-            wrk.connection_sockets = allocator.alloc(native.socket.Socket, slot_count) catch return error.SlotOwners;
+            wrk.connection_sockets = allocator.alloc(native.socket.Socket, slot_count) catch {
+                return .{ .failure = .{ .stage = "allocate worker socket owners", .code = types.error_not_enough_memory, .domain = .allocation } };
+            };
             for (wrk.connection_sockets) |*owner| owner.* = .{};
-            wrk.request_queues = allocator.alloc(c.RIO_RQ, slot_count) catch return error.RequestQueues;
+            wrk.request_queues = allocator.alloc(c.RIO_RQ, slot_count) catch {
+                return .{ .failure = .{ .stage = "allocate worker request queues", .code = types.error_not_enough_memory, .domain = .allocation } };
+            };
             @memset(wrk.request_queues, c.RIO_INVALID_RQ);
-            wrk.steps = allocator.alloc(engine.Step, engine.stepCapacity(slot_count)) catch return error.Steps;
+            wrk.provider_requests = allocator.alloc(ProviderRequest, slot_count) catch
+                return .{ .failure = .{ .stage = "allocate worker provider ledger", .code = types.error_not_enough_memory, .domain = .allocation } };
+            @memset(wrk.provider_requests, .{});
+            wrk.steps = allocator.alloc(engine.Step, engine.stepCapacity(slot_count)) catch {
+                return .{ .failure = .{ .stage = "allocate worker actions", .code = types.error_not_enough_memory, .domain = .allocation } };
+            };
             wrk.engine_value = engine.TcpEngine.init(slot_count, @as(u64, options.timeout_seconds) * 1000) catch |failure| {
-                native.diagnostics.report("worker engine slots", c.ERROR_NOT_ENOUGH_MEMORY);
-                return switch (failure) {
-                    error.Capacity => error.Capacity,
-                    error.Allocation => error.Capacity,
-                    error.TimerHeap => error.Engine,
-                };
+                return .{ .failure = switch (failure) {
+                    error.TimerHeap => types.Failure.invariant("worker engine timer heap"),
+                    else => .{ .stage = "worker engine slots", .code = types.error_not_enough_memory, .domain = .allocation },
+                } };
             };
             var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
             notification.Type = c.RIO_IOCP_COMPLETION;
@@ -554,9 +615,10 @@ pub const worker = struct {
             notification.Iocp.Overlapped = @ptrCast(&wrk.notification_overlapped);
             wrk.completion_queue.reset(api, api.createCq(slot_count * 2, &notification));
             if (!wrk.completion_queue.valid()) {
-                native.diagnostics.report("RIOCreateCompletionQueue(worker)", @bitCast(c.WSAGetLastError()));
-                return error.CompletionQueue;
+                return .{ .failure = native.winsockFailure("RIOCreateCompletionQueue(worker)") };
             }
+            initialized = true;
+            return .{ .value = {} };
         }
 
         fn threadEntry(parameter: ?*anyopaque) callconv(.winapi) c.DWORD {
@@ -600,20 +662,38 @@ pub const worker = struct {
             }
         }
 
+        pub fn requireRelease(wrk: *const Worker) void {
+            if (wrk.provider_outstanding != 0 or wrk.engine_value.outstanding() != 0) failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
+            for (wrk.provider_requests) |request| {
+                if (request.operation != null) failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
+            }
+            if (wrk.ready and (!wrk.engine_value.stopping or !wrk.engine_value.admission_closed or
+                !wrk.engine_value.mayExit() or wrk.engine_value.freeCount() != wrk.engine_value.slotCount() or
+                (wrk.credits != null and !wrk.credits.?.isFull())))
+            {
+                failFast("TCP worker release precondition", c.ERROR_IO_INCOMPLETE);
+            }
+            const snapshot = types.NotifySnapshot{ .worker = wrk.worker_index, .arms = wrk.notification_arms, .deliveries = wrk.notification_deliveries, .timeout_wakeups = wrk.timeout_wakeups };
+            if (wrk.ready and !snapshot.valid()) failFast("worker notification accounting", c.ERROR_INVALID_STATE);
+        }
+
         /// Releases every native object in the order the design fixes: sockets, completion queue,
         /// registrations, the single page owner, the host arrays, then the port.
         pub fn destroy(wrk: *Worker) void {
             const allocator = std.heap.page_allocator;
             join(wrk);
+            requireRelease(wrk);
             wrk.thread.deinit();
-            for (wrk.connection_sockets) |*owner| owner.deinit();
             wrk.completion_queue.deinit();
             wrk.arena.deinit();
+            for (wrk.connection_sockets) |*owner| owner.deinit();
             if (wrk.connection_sockets.len != 0) allocator.free(wrk.connection_sockets);
             if (wrk.request_queues.len != 0) allocator.free(wrk.request_queues);
+            if (wrk.provider_requests.len != 0) allocator.free(wrk.provider_requests);
             if (wrk.steps.len != 0) allocator.free(wrk.steps);
             wrk.connection_sockets = &.{};
             wrk.request_queues = &.{};
+            wrk.provider_requests = &.{};
             wrk.steps = &.{};
             wrk.engine_value.deinit();
             wrk.ready_event.deinit();
@@ -622,52 +702,92 @@ pub const worker = struct {
         }
 
         fn workerThread(wrk: *Worker) c.DWORD {
+            wrk.engine_value.phase = .running;
             maybeArm(wrk);
             wrk.ready = true;
             if (c.SetEvent(wrk.ready_event.get()) == c.FALSE) failFast("SetEvent(worker ready)", c.GetLastError());
+            var expired_packets: u32 = 0;
+            const expired_packet_budget = wrk.engine_value.slotCount() + contract.acceptOperationCount(types.maximum_workers) + 2;
 
             while (true) {
-                const wait = wrk.engine_value.waitingMilliseconds(native.nowMilliseconds());
+                const now = native.nowMilliseconds();
+                const drain_due = if (wrk.drain_started) |started|
+                    now - started >= types.drain_milliseconds and wrk.provider_outstanding != 0
+                else
+                    false;
+                const wait = if (drain_due or wrk.engine_value.waitingMilliseconds(now) == 0) 0 else if (wrk.engine_value.stopping)
+                    @min(wrk.engine_value.waitingMilliseconds(now), 100)
+                else
+                    wrk.engine_value.waitingMilliseconds(now);
                 const packet = native.rio.getQueuedCompletionStatus(wrk.port.get(), wait);
+                const queued_record = packet.ok or packet.overlapped != null or packet.key != 0;
                 if (packet.overlapped == &wrk.notification_overlapped) {
                     if (!packet.ok) failFast("GetQueuedCompletionStatus(worker notification)", packet.native_error);
                     if (!contract.notificationPacketMatches(packet.key, @intFromPtr(packet.overlapped.?), @intFromPtr(wrk), @intFromPtr(&wrk.notification_overlapped))) {
                         failFast("worker RIO notification key", c.ERROR_INVALID_DATA);
                     }
                     native.guards.requireTransition(contract.notificationMarkDelivered(&wrk.completion_queue.armed), "notification delivery transition");
+                    wrk.engine_value.notification_armed = wrk.completion_queue.armed;
                     wrk.notification_deliveries +%= 1;
-                    drain(wrk);
+                    drain(wrk, types.completion_drain_batches, std.math.maxInt(u32));
                     maybeArm(wrk);
                 } else if (packet.overlapped == null and packet.key == types.stop_key) {
                     stopNow(wrk);
                 } else if (packet.overlapped == null and packet.key == types.admission_closed_key) {
-                    wrk.engine_value.closeAdmission();
+                    _ = wrk.engine_value.onEvent(.admission_closed, wrk.steps);
                 } else if (packet.overlapped == null and packet.key > types.admission_closed_key) {
                     const operation: *acceptor.Operation = @ptrFromInt(packet.key);
                     takeSocket(wrk, operation);
                 } else if (!packet.ok and packet.native_error != c.WAIT_TIMEOUT) {
                     native.diagnostics.report("GetQueuedCompletionStatus(worker)", packet.native_error);
+                    wrk.engine_value.statistics.network_errors +%= 1;
                     wrk.failed.?.store(true, .release);
                     stopNow(wrk);
                 } else if (!(!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null)) {
                     failFast("unexpected worker IOCP packet", c.ERROR_INVALID_DATA);
                 }
 
-                if (!packet.ok and packet.native_error == c.WAIT_TIMEOUT and wrk.engine_value.outstanding() != 0) {
+                if (!packet.ok and packet.native_error == c.WAIT_TIMEOUT and !wrk.engine_value.stopping and
+                    wrk.engine_value.outstanding() != 0 and !wrk.completion_queue.armed)
+                {
                     wrk.timeout_wakeups +%= 1;
                 }
-                const expired = wrk.engine_value.onTimeout(native.nowMilliseconds(), wrk.steps);
+                if (wrk.engine_value.stopping and wrk.engine_value.admission_closed and wrk.engine_value.activeCount() == 0) break;
+                const after_packet = native.nowMilliseconds();
+                const still_draining = if (wrk.drain_started) |started|
+                    after_packet - started >= types.drain_milliseconds and wrk.provider_outstanding != 0
+                else
+                    false;
+                if (still_draining or wrk.engine_value.waitingMilliseconds(after_packet) == 0) {
+                    // Include handoffs plus both shutdown controls in the bounded zero-wait pass:
+                    // they may precede a queued RIO notification even on a worker with one slot.
+                    if (queued_record and expired_packets < expired_packet_budget) {
+                        expired_packets += 1;
+                        continue;
+                    }
+                    // A pending RIONotify does not prove the CQ is empty. The final pass retires
+                    // at most one record per slot in total, even with one-record short dequeues.
+                    // Direct CQ polling leaves the notification ownership and ledger untouched.
+                    drain(wrk, wrk.engine_value.slotCount(), wrk.engine_value.slotCount());
+                    maybeArm(wrk);
+                    const drain_expired = if (wrk.drain_started) |started|
+                        after_packet - started >= types.drain_milliseconds and wrk.provider_outstanding != 0
+                    else
+                        false;
+                    if (drain_expired) failFast("TCP worker drain deadline", c.ERROR_TIMEOUT);
+                    expired_packets = 0;
+                } else expired_packets = 0;
+                const expired = wrk.engine_value.onEvent(.{ .timeout = after_packet }, wrk.steps);
                 executeAll(wrk, expired);
                 if (wrk.engine_value.fatal) {
-                    wrk.failed.?.store(true, .release);
-                    stopNow(wrk);
+                    if (wrk.engine_value.failure) |failure| failFast(failure.stage, @bitCast(failure.code));
+                    failFast("worker engine invariant", c.ERROR_INVALID_DATA);
                 }
                 if (wrk.engine_value.stopping and wrk.engine_value.admission_closed and wrk.engine_value.activeCount() == 0) break;
             }
 
-            const outstanding = wrk.engine_value.outstanding();
-            native.guards.requireTransition(outstanding == 0, "worker CQ retirement with outstanding operations");
-            wrk.completion_queue.deinit();
+            // The coordinator joins every worker before checking any release precondition.
+            wrk.engine_value.phase = .stopped;
             return if (wrk.failed.?.load(.acquire)) 1 else 0;
         }
     };
@@ -762,6 +882,14 @@ pub const acceptor = struct {
         none,
     };
 
+    pub const Event = union(enum) {
+        completion: struct { index: u32, completed: bool, code: i32 },
+        acknowledged: u32,
+        stop,
+    };
+
+    pub const Lifecycle = struct { stopping: bool, live: u32, posted: u32 };
+
     /// What the acceptor does with one slot when it stops. This is a shutdown disposition, not the
     /// decision a completion produces; that one is AcceptAction above.
     pub const SlotDisposition = enum(u8) { none, close_posted, wait_ack };
@@ -808,7 +936,6 @@ pub const acceptor = struct {
         return status == 64 or status == types.wsa_econnreset or status == types.wsa_econnaborted;
     }
 
-
     /// Round-robin over the workers that still have a credit. Scanning instead of taking the next
     /// index is what keeps a saturated worker from being handed a socket it would have to refuse.
     pub fn selectWorker(credits: []AdmissionCredits, rotation: *u32, worker_count: u32) ?u32 {
@@ -850,6 +977,21 @@ pub const acceptor = struct {
         pub fn init(states: []State) Core {
             @memset(states, .idle);
             return .{ .states = states };
+        }
+
+        pub fn onEvent(self: *Core, event: Event) AcceptAction {
+            return switch (event) {
+                .completion => |value| self.onCompletion(value.index, value.completed, value.code),
+                .acknowledged => |index| self.onAck(index),
+                .stop => {
+                    self.stop();
+                    return .none;
+                },
+            };
+        }
+
+        pub fn lifecycle(self: *const Core) Lifecycle {
+            return .{ .stopping = self.stopping, .live = self.liveCount(), .posted = self.postedCount() };
         }
 
         pub fn count(self: *const Core) u32 {
@@ -974,7 +1116,6 @@ pub const acceptor = struct {
         }
     };
 
-
     pub const Operation = struct {
         overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
         owner: ?*Acceptor = null,
@@ -983,9 +1124,12 @@ pub const acceptor = struct {
         acceptor_port: c.HANDLE = null,
         index: u32 = 0,
         addresses: [types.accept_operation_bytes]u8 = @splat(0),
+        provider_owned: bool = false,
     };
 
     pub const Acceptor = struct {
+        drain_started: ?u64 = null,
+        last_failure: ?types.Failure = null,
         // Native ownership, read and written only by the acceptor thread and its lifecycle calls.
         listener: native.socket.Socket = .{},
         port: native.handle.Handle = .{},
@@ -1042,14 +1186,22 @@ pub const acceptor = struct {
     };
 
     pub const InitError = error{
-        WorkerCount, Listener, Port, ReadyEvent, ConfigureSocket, BindListen,
-        AssociateIocp, AcceptExExtension, AddressExtension, Operations, Credits,
+        WorkerCount,
+        Listener,
+        Port,
+        ReadyEvent,
+        ConfigureSocket,
+        BindListen,
+        AssociateIocp,
+        AcceptExExtension,
+        AddressExtension,
+        Operations,
+        Credits,
     };
 
     fn failFast(stage: []const u8, native_error: u32) noreturn {
         native.diagnostics.failFast(stage, native_error);
     }
-
 
     fn operationInRange(self: *const Acceptor, operation: *const Operation) bool {
         if (self.operations.len == 0) return false;
@@ -1068,6 +1220,7 @@ pub const acceptor = struct {
     /// times; once those are spent the slot yields to a queued repost packet instead of spinning on
     /// a queue that keeps refusing it.
     pub fn postAccept(self: *Acceptor, operation: *Operation) bool {
+        if (operation.provider_owned) failFast("AcceptEx repost ownership", c.ERROR_INVALID_STATE);
         var attempt: u32 = 0;
         while (attempt < synchronous_attempts) : (attempt += 1) {
             if (self.core.stopping or self.failed.?.load(.acquire) or self.listener.get() == c.INVALID_SOCKET) return true;
@@ -1075,7 +1228,8 @@ pub const acceptor = struct {
             operation.socket_owner.reset(native.socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP));
             operation.socket = operation.socket_owner.get();
             if (operation.socket == c.INVALID_SOCKET) {
-                native.diagnostics.report("WSASocketW(accepted RIO socket)", @bitCast(c.WSAGetLastError()));
+                self.last_failure = native.winsockFailure("WSASocketW(accepted RIO socket)");
+                native.diagnostics.reportFailure(self.last_failure.?);
                 self.core.network_errors +%= 1;
                 return false;
             }
@@ -1093,18 +1247,25 @@ pub const acceptor = struct {
                 &received,
                 &operation.overlapped,
             );
-            if (accepted != c.FALSE) return true;
+            if (accepted != c.FALSE) {
+                operation.provider_owned = true;
+                return true;
+            }
             const status = c.WSAGetLastError();
             // AcceptEx is asynchronous: a pending result is the normal outcome, and only any other
             // refusal means the operation was never queued.
-            if (status == @as(i32, @intCast(c.ERROR_IO_PENDING))) return true;
+            if (status == @as(i32, @intCast(c.ERROR_IO_PENDING))) {
+                operation.provider_owned = true;
+                return true;
+            }
             _ = self.core.transition(operation.index, .posted, .idle);
             closeAccepted(operation);
             // A refused attempt is a network error whether or not it can be retried, exactly as the
             // reference counts it.
             self.core.network_errors +%= 1;
             if (!acceptErrorIsRecoverable(status)) {
-                native.diagnostics.report("AcceptEx", @bitCast(status));
+                self.last_failure = .{ .stage = "AcceptEx", .code = status };
+                native.diagnostics.reportFailure(self.last_failure.?);
                 return false;
             }
         }
@@ -1120,18 +1281,18 @@ pub const acceptor = struct {
     /// Executes the acknowledgement the core decided. The transition and the repost-or-retire choice
     /// are the core's; this only carries them out.
     fn resumeSlot(self: *Acceptor, operation: *Operation) void {
-        switch (self.core.onAck(operation.index)) {
+        switch (self.core.onEvent(.{ .acknowledged = operation.index })) {
             .none => {},
             .fail => failFast("accept acknowledgement state", c.ERROR_INVALID_DATA),
             .repost => {
                 if (!postAccept(self, operation)) {
-                    failAndStop(self, "AcceptEx repost", @intCast(c.WSAGetLastError()));
+                    const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost");
+                    failAndStop(self, failure.stage, @bitCast(failure.code));
                 }
             },
             .handoff => failFast("accept acknowledgement action", c.ERROR_INVALID_DATA),
         }
     }
-
 
     fn failAndStop(self: *Acceptor, stage: []const u8, native_error: u32) void {
         native.diagnostics.report(stage, native_error);
@@ -1152,7 +1313,8 @@ pub const acceptor = struct {
     /// which runs after the thread is joined and no completion is outstanding.
     pub fn beginStop(self: *Acceptor) void {
         if (self.core.stopping) return;
-        self.core.stop();
+        self.drain_started = native.nowMilliseconds();
+        _ = self.core.onEvent(.stop);
         self.listener.deinit();
         for (self.operations) |*operation| {
             // Closing the accepted socket cancels its outstanding AcceptEx; the completion is then
@@ -1187,7 +1349,7 @@ pub const acceptor = struct {
         // socket. The decision is the core's: it moves the slot and names the next step. The loop has
         // already proved this slot is posted and owned, so the only outcomes here are the ones a real
         // completion produces, and every one of them is executed below rather than decided here.
-        switch (self.core.onCompletion(operation.index, packet_ok, @bitCast(native_error))) {
+        switch (self.core.onEvent(.{ .completion = .{ .index = operation.index, .completed = packet_ok, .code = @bitCast(native_error) } })) {
             .none => return,
             .fail => |failure| {
                 // The slot is unposted by beginStop, so a failure that arrives under stopping is the
@@ -1198,8 +1360,12 @@ pub const acceptor = struct {
                 failAndStop(self, "AcceptEx completion", @bitCast(failure.code));
             },
             .repost => {
+                if (acceptorCountsFailure(self.core.stopping, self.failed.?.load(.acquire))) self.core.network_errors +%= 1;
                 closeAccepted(operation);
-                if (!postAccept(self, operation)) failAndStop(self, "AcceptEx repost", native_error);
+                if (!postAccept(self, operation)) {
+                    const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost");
+                    failAndStop(self, failure.stage, @bitCast(failure.code));
+                }
             },
             .handoff => |handoff| executeHandoff(self, operation, handoff.worker),
         }
@@ -1231,6 +1397,7 @@ pub const acceptor = struct {
         const configuration = native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) orelse
             native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true);
         if (configuration) |failure| {
+            self.core.network_errors +%= 1;
             // The status was captured at the call that produced it, so the transition and the socket
             // cleanup below cannot replace the reason this failed.
             if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
@@ -1264,9 +1431,9 @@ pub const acceptor = struct {
             if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept capacity state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
             self.core.rejected +%= 1;
-            if (!self.core.transition(operation.index, .idle, .deferred)) failFast("accept defer state", c.ERROR_INVALID_STATE);
-            if (!native.rio.postCompletion(self.port.get(), @intFromPtr(operation), null)) {
-                failFast("PostQueuedCompletionStatus(refused AcceptEx repost)", c.GetLastError());
+            if (!postAccept(self, operation)) {
+                const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost after capacity rejection");
+                failAndStop(self, failure.stage, @bitCast(failure.code));
             }
             return;
         };
@@ -1289,6 +1456,7 @@ pub const acceptor = struct {
             posted += 1;
         }
         publishReady(self, posted);
+        var expired_packets: u32 = 0;
 
         while (!self.core.stopping or self.liveCount() != 0) {
             // A worker that failed publishes the global flag before the coordinator posts the stop
@@ -1299,7 +1467,19 @@ pub const acceptor = struct {
                 beginStop(self);
                 if (self.liveCount() == 0) break;
             }
-            const packet = native.rio.getQueuedCompletionStatus(self.port.get(), 100);
+            const drain_due = if (self.drain_started) |started|
+                native.nowMilliseconds() - started >= types.drain_milliseconds
+            else
+                false;
+            const packet = native.rio.getQueuedCompletionStatus(self.port.get(), if (drain_due) 0 else 100);
+            if (drain_due) {
+                if ((!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null) or
+                    expired_packets >= self.operationCount() + 1)
+                {
+                    failFast("TCP acceptor drain deadline", c.ERROR_TIMEOUT);
+                }
+                expired_packets += 1;
+            } else expired_packets = 0;
             if (packet.overlapped == null and packet.key == types.stop_key) {
                 beginStop(self);
                 continue;
@@ -1318,9 +1498,12 @@ pub const acceptor = struct {
 
             if (packet.overlapped != null) {
                 const operation: *Operation = @fieldParentPtr("overlapped", packet.overlapped.?);
-                if (!operationInRange(self, operation) or self.core.state(operation.index) != .posted) {
+                if (!operationInRange(self, operation) or self.core.state(operation.index) != .posted or !operation.provider_owned) {
                     failFast("AcceptEx completion identity", c.ERROR_INVALID_DATA);
                 }
+                // AcceptEx was posted with zero receive bytes. Validate before returning ownership.
+                if (packet.transferred != 0) failFast("AcceptEx completion payload extent", c.ERROR_INVALID_DATA);
+                operation.provider_owned = false;
                 if (!packet.ok and self.core.stopping) {
                     if (!self.core.transition(operation.index, .posted, .idle)) failFast("cancelled accept state", c.ERROR_INVALID_STATE);
                     closeAccepted(operation);
@@ -1330,6 +1513,7 @@ pub const acceptor = struct {
                 continue;
             }
             if (!packet.ok and packet.native_error != c.WAIT_TIMEOUT) {
+                self.core.network_errors +%= 1;
                 failAndStop(self, "GetQueuedCompletionStatus(acceptor)", packet.native_error);
             } else if (!(!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null)) {
                 failFast("unexpected acceptor IOCP packet", c.ERROR_INVALID_DATA);
@@ -1349,11 +1533,29 @@ pub const acceptor = struct {
         credits: []AdmissionCredits,
         failed: *std.atomic.Value(bool),
     ) InitError!void {
+        switch (initializeResult(self, api, options, workers, credits, failed)) {
+            .value => {},
+            .failure => |failure| {
+                native.diagnostics.reportFailure(failure);
+                return error.Listener;
+            },
+        }
+    }
+
+    pub fn initializeResult(
+        self: *Acceptor,
+        api: *const native.rio.Api,
+        options: *const types.Options,
+        workers: []TcpWorker,
+        credits: []AdmissionCredits,
+        failed: *std.atomic.Value(bool),
+    ) native.Result(void) {
         const allocator = std.heap.page_allocator;
         self.* = .{};
-        errdefer destroy(self);
-        if (workers.len == 0 or workers.len > std.math.maxInt(u32)) return error.WorkerCount;
-        if (credits.len != workers.len) return error.Credits;
+        var initialized = false;
+        defer if (!initialized) destroy(self);
+        if (workers.len == 0 or workers.len > std.math.maxInt(u32)) return .{ .failure = types.Failure.invariant("acceptor worker count") };
+        if (credits.len != workers.len) return .{ .failure = types.Failure.invariant("acceptor credit count") };
         self.api = api;
         self.options = options;
         self.workers = workers;
@@ -1362,46 +1564,44 @@ pub const acceptor = struct {
 
         self.listener.reset(native.socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP));
         if (self.listener.get() == c.INVALID_SOCKET) {
-            native.diagnostics.report("TCP listener creation", @bitCast(c.WSAGetLastError()));
-            return error.Listener;
+            return .{ .failure = native.winsockFailure("TCP listener creation") };
         }
         self.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
         if (self.port.value == null or self.port.value == c.INVALID_HANDLE_VALUE) {
-            native.diagnostics.report("TCP acceptor IOCP creation", c.GetLastError());
-            return error.Port;
+            return .{ .failure = native.win32Failure("TCP acceptor IOCP creation") };
         }
         self.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
         if (self.ready_event.value == null) {
-            native.diagnostics.report("TCP acceptor event creation", c.GetLastError());
-            return error.ReadyEvent;
+            return .{ .failure = native.win32Failure("TCP acceptor event creation") };
         }
         if (native.socket.configure(self.listener.get(), options.socket_buffer_bytes, true)) |failure| {
-            native.diagnostics.report(failure.stage, @bitCast(failure.native_error));
-            return error.ConfigureSocket;
+            return .{ .failure = .{ .stage = failure.stage, .code = failure.native_error } };
         }
-        if (!native.endpoint.bindEndpoint(self.listener.get(), options.port) or !native.endpoint.listenEndpoint(self.listener.get())) {
-            return error.BindListen;
-        }
+        if (native.endpoint.bindFailure(self.listener.get(), options.port)) |failure| return .{ .failure = failure };
+        if (native.endpoint.listenFailure(self.listener.get())) |failure| return .{ .failure = failure };
         const listener_handle: c.HANDLE = @ptrFromInt(self.listener.get());
         if (c.CreateIoCompletionPort(listener_handle, self.port.get(), 0, 1) != self.port.get()) {
-            native.diagnostics.report("associate listener IOCP", c.GetLastError());
-            return error.AssociateIocp;
+            return .{ .failure = native.win32Failure("associate listener IOCP") };
         }
-        self.accept_ex = native.endpoint.acceptExtension(self.listener.get()) orelse return error.AcceptExExtension;
-        self.get_accept_addresses = native.endpoint.acceptAddressesExtension(self.listener.get()) orelse return error.AddressExtension;
+        self.accept_ex = switch (native.endpoint.acceptExtensionResult(self.listener.get())) {
+            .value => |value| value,
+            .failure => |failure| return .{ .failure = failure },
+        };
+        self.get_accept_addresses = switch (native.endpoint.acceptAddressesExtensionResult(self.listener.get())) {
+            .value => |value| value,
+            .failure => |failure| return .{ .failure = failure },
+        };
 
         const count = operation_count(self.workerCount());
         self.states = allocator.alloc(State, count) catch {
-            native.diagnostics.report("allocate accept states", c.ERROR_NOT_ENOUGH_MEMORY);
-            return error.Operations;
+            return .{ .failure = .{ .stage = "allocate accept states", .code = types.error_not_enough_memory, .domain = .allocation } };
         };
         self.core = Core.init(self.states);
         // Set after the core is built: Core.init replaces the whole record, so a count written before
         // it would be wiped and the rotation would have no workers to walk.
-                self.core.worker_count = @intCast(workers.len);
+        self.core.worker_count = @intCast(workers.len);
         self.operations = allocator.alloc(Operation, count) catch {
-            native.diagnostics.report("allocate accept operations", c.ERROR_NOT_ENOUGH_MEMORY);
-            return error.Operations;
+            return .{ .failure = .{ .stage = "allocate accept operations", .code = types.error_not_enough_memory, .domain = .allocation } };
         };
         for (self.operations, 0..) |*operation, index| {
             operation.* = .{
@@ -1410,6 +1610,8 @@ pub const acceptor = struct {
                 .index = @intCast(index),
             };
         }
+        initialized = true;
+        return .{ .value = {} };
     }
 
     pub fn start(self: *Acceptor) bool {
@@ -1440,6 +1642,15 @@ pub const acceptor = struct {
         }
     }
 
+    pub fn requireRelease(self: *const Acceptor) void {
+        if (self.core.liveCount() != 0) {
+            native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
+        }
+        for (self.operations) |operation| {
+            if (operation.provider_owned) native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
+        }
+    }
+
     /// Releases the accept table, the listener, the event and the port. Every published handoff has
     /// already been acknowledged and every posted accept retired, so nothing is left in flight.
     /// Stops the acceptor, waits for its thread, proves that Windows no longer owns any accept slot,
@@ -1453,10 +1664,8 @@ pub const acceptor = struct {
     pub fn destroy(self: *Acceptor) void {
         const allocator = std.heap.page_allocator;
         join(self);
+        requireRelease(self);
         self.thread.deinit();
-        if (self.core.liveCount() != 0) {
-            native.diagnostics.failFast("TCP acceptor terminal operations", c.ERROR_IO_INCOMPLETE);
-        }
         for (self.operations) |*operation| closeAccepted(operation);
         if (self.operations.len != 0) allocator.free(self.operations);
         self.operations = &.{};
@@ -1482,6 +1691,8 @@ pub const TcpWorker = struct {
     completion_queue: native.rio.CompletionQueue = .{},
     connection_sockets: []native.socket.Socket = &.{},
     request_queues: []c.RIO_RQ = &.{},
+    provider_requests: []worker.ProviderRequest = &.{},
+    provider_outstanding: u32 = 0,
     steps: []engine.Step = &.{},
     engine_value: engine.TcpEngine = .{},
     credits: ?*acceptor.AdmissionCredits = null,
@@ -1494,6 +1705,7 @@ pub const TcpWorker = struct {
     notification_arms: u64 = 0,
     notification_deliveries: u64 = 0,
     timeout_wakeups: u64 = 0,
+    drain_started: ?u64 = null,
     ready: bool = false,
 
     pub fn stride(self: *const TcpWorker) u32 {
@@ -1512,397 +1724,478 @@ pub const udp = struct {
     pub const Slot = struct {
         payload: c.RIO_BUF = .{ .BufferId = c.RIO_INVALID_BUFFERID, .Offset = 0, .Length = 0 },
         remote_address: c.RIO_BUF = .{ .BufferId = c.RIO_INVALID_BUFFERID, .Offset = 0, .Length = 0 },
+        provider_operation: ?types.EngineOperation = null,
+        posted_length: u32 = 0,
     };
 
-    /// What one completion means for its slot.
+    /// Legacy classification vocabulary; production decisions carry their complete payload below.
     pub const Action = enum(u8) { repost_receive, repost_send, drop, fatal };
-
-    /// The pure state of one datagram slot: the direction it is armed in, and whether the provider
-    /// still owns an operation for it.
-    ///
-    /// The two belong together. A direction without ownership cannot tell a genuine completion from
-    /// a repeated one, and an ownership flag without a direction cannot decide what the completion
-    /// means, so the pair is the unit the ledger is kept in.
+    pub const PostAction = struct { index: u32, operation: types.EngineOperation, payload_length: u32 };
+    pub const UdpAction = union(enum) {
+        post: PostAction,
+        fatal: struct { index: u32, failure: types.Failure },
+        none,
+    };
+    pub const Event = union(enum) {
+        completion: types.Completion,
+        post_failed: struct { index: u32, failure: types.Failure },
+        stop,
+        drained,
+    };
     pub const SlotState = struct {
         direction: types.EngineOperation = .receive,
+        payload_length: u32 = 0,
         outstanding: bool = false,
     };
 
-    /// The pure UDP engine: which direction each slot is armed in, the in-flight ledger, the error
-    /// classification and the statistics.
-    ///
-    /// It performs no I/O. A completion sequence can be replayed against it with no socket, request
-    /// queue or completion port, which is what makes the slot transitions and the ledger testable on
-    /// their own.
+    /// Pure UDP state. Native resources and post execution belong exclusively to Runtime.
     pub const Engine = struct {
-        /// The direction each slot is currently armed in. Ownership of a slot lives here, next to
-        /// the ledger it feeds, rather than in the native record the kernel writes.
         slots: []SlotState = &.{},
-        /// Operations the provider still owns. The loop may only end, and the arena may only be
-        /// released, once this is back to zero.
+        payload_bytes: u32 = 0,
         outstanding: u32 = 0,
+        phase: types.UdpPhase = .running,
         statistics: types.Statistics = .{},
-        /// The socket is closed, so no further post is legitimate and completions only retire.
         closing: bool = false,
+        failed: bool = false,
+        failure: ?types.Failure = null,
 
         pub fn init(slots: []SlotState) Engine {
-            for (slots) |*slot| slot.* = .{};
-            return .{ .slots = slots };
+            return initWithCapacity(slots, @intCast(types.maximum_udp_payload));
+        }
+
+        pub fn initWithCapacity(slots: []SlotState, capacity: u32) Engine {
+            for (slots) |*slot| slot.* = .{ .payload_length = capacity };
+            return .{ .slots = slots, .payload_bytes = capacity };
         }
 
         pub fn direction(self: *const Engine, index: u32) types.EngineOperation {
             return if (index < self.slots.len) self.slots[index].direction else .receive;
         }
 
-        /// The runtime armed a slot, so ownership of that one slot moved to the provider. The
-        /// per-slot flag and the total move together, which is what makes the pair exact.
-        ///
-        /// The refusals are what keep that pair exact. An out-of-range index owns no slot, and a slot
-        /// that is already outstanding already owns an operation, so counting either would raise the
-        /// total without a matching slot. A closing engine has no legitimate new post. The provider
-        /// has already accepted the request by the time this is called, so a refusal is an invariant
-        /// failure for the caller to fail fast on rather than an accounting entry to ignore: the
-        /// result reports whether the registration was made, and only a true result licenses the
-        /// caller to continue.
-        pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) bool {
-            if (index >= self.slots.len or
-                self.closing or
-                self.slots[index].outstanding or
-                self.outstanding >= self.slots.len)
-            {
-                return false;
+        pub fn initialPost(self: *const Engine, index: u32) UdpAction {
+            if (index >= self.slots.len or self.closing or self.slots[index].outstanding) {
+                return .{ .fatal = .{ .index = index, .failure = types.Failure.invariant("UDP post ownership") } };
             }
-            self.slots[index] = .{ .direction = operation, .outstanding = true };
+            return .{ .post = .{ .index = index, .operation = self.slots[index].direction, .payload_length = self.slots[index].payload_length } };
+        }
+
+        /// Called only after the provider accepted this request. Refusal is an invariant failure.
+        pub fn markPosted(self: *Engine, index: u32) bool {
+            if (index >= self.slots.len or self.closing or self.slots[index].outstanding or
+                self.outstanding >= self.slots.len) return false;
+            self.slots[index].outstanding = true;
             self.outstanding += 1;
             return true;
         }
 
-        /// A post the runtime attempted and the provider refused. The slot never became outstanding,
-        /// so only the ledger of failures moves.
-        pub fn onPostFailure(self: *Engine) void {
-            self.statistics.network_errors +%= 1;
+        pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) bool {
+            if (index >= self.slots.len or self.closing or self.slots[index].outstanding) return false;
+            self.slots[index].direction = operation;
+            if (operation == .receive) self.slots[index].payload_length = self.payload_bytes;
+            return self.markPosted(index);
         }
 
         pub fn hasWork(self: *const Engine) bool {
             return self.outstanding != 0;
         }
 
-        /// The runtime is about to close the socket: no further post is legitimate, and the drain
-        /// only has to retire what is already in flight.
         pub fn beginClose(self: *Engine) void {
             self.closing = true;
+            if (self.phase == .running) self.phase = .draining;
         }
 
-        /// The provider owns nothing, so the registered arena and the request queue may be released.
+        pub fn lifecycle(self: *const Engine) types.UdpLifecycle {
+            return .{ .phase = self.phase, .outstanding = self.outstanding, .closing = self.closing, .failed = self.failed };
+        }
+
         pub fn mayRelease(self: *const Engine) bool {
-            return self.outstanding == 0;
+            return self.lifecycle().mayRelease();
         }
 
-        /// One completion: ownership is retired and the ledger and statistics move before the action
-        /// is decided, so a completion can never be accounted twice or steered twice.
-        pub fn onCompletion(self: *Engine, index: u32, status: i32, bytes: u32, capacity: u32) Action {
-            // The per-slot ownership is checked and retired first. A duplicated completion for one
-            // slot must not retire another slot's operation: with only the total to compare against,
-            // two outstanding slots and a repeated completion for one of them would drain the ledger
-            // to zero while an operation is still with the provider.
-            if (index >= self.slots.len) return .fatal;
-            if (!self.slots[index].outstanding or self.outstanding == 0) return .fatal;
-            const operation = self.slots[index].direction;
-            self.slots[index].outstanding = false;
-            self.outstanding -= 1;
-            self.statistics.completions +%= 1;
-            switch (operation) {
-                .receive => {
-                    if (status == types.error_success) {
-                        self.statistics.receives +%= 1;
-                        self.statistics.received_bytes +%= bytes;
-                    }
+        fn fail(self: *Engine, index: u32, failure: types.Failure) UdpAction {
+            self.failure = failure;
+            self.failed = true;
+            self.beginClose();
+            return .{ .fatal = .{ .index = index, .failure = failure } };
+        }
+
+        pub fn onEvent(self: *Engine, event: Event) UdpAction {
+            switch (event) {
+                .stop => {
+                    self.beginClose();
+                    return .none;
                 },
-                .send => {
-                    if (status == types.error_success) {
-                        self.statistics.sends +%= 1;
-                        self.statistics.sent_bytes +%= bytes;
-                        self.statistics.bytes +%= bytes;
+                .drained => {
+                    if (self.outstanding != 0 or !self.closing) {
+                        return .{ .fatal = .{ .index = 0, .failure = types.Failure.invariant("UDP release precondition") } };
                     }
+                    self.phase = .stopped;
+                    return .none;
+                },
+                .post_failed => |value| {
+                    // A refused submission never entered the provider. It cannot erase older work.
+                    if (value.index >= self.slots.len or self.slots[value.index].outstanding) {
+                        return .{ .fatal = .{ .index = value.index, .failure = types.Failure.invariant("UDP refused post ownership") } };
+                    }
+                    self.statistics.network_errors +%= 1;
+                    return self.fail(value.index, value.failure);
+                },
+                .completion => |value| {
+                    if (value.index >= self.slots.len or self.outstanding == 0 or
+                        !self.slots[value.index].outstanding or self.slots[value.index].direction != value.operation)
+                    {
+                        return .{ .fatal = .{ .index = value.index, .failure = types.Failure.invariant("UDP completion invariant") } };
+                    }
+                    const slot = &self.slots[value.index];
+                    slot.outstanding = false;
+                    self.outstanding -= 1;
+                    self.statistics.completions +%= 1;
+                    if (value.status == types.error_success) {
+                        switch (value.operation) {
+                            .receive => {
+                                self.statistics.receives +%= 1;
+                                self.statistics.received_bytes +%= value.bytes;
+                            },
+                            .send => {
+                                self.statistics.sends +%= 1;
+                                self.statistics.sent_bytes +%= value.bytes;
+                                self.statistics.bytes +%= value.bytes;
+                            },
+                        }
+                    } else if (!self.closing) self.statistics.network_errors +%= 1;
+                    if (self.closing) return .none;
+                    if (value.status != types.error_success) {
+                        if (value.status != types.wsa_econnreset) {
+                            return self.fail(value.index, .{ .stage = "UDP RIO completion", .code = value.status });
+                        }
+                        slot.direction = .receive;
+                        slot.payload_length = self.payload_bytes;
+                    } else if (value.operation == .receive) {
+                        slot.direction = .send;
+                        slot.payload_length = value.bytes;
+                    } else {
+                        slot.direction = .receive;
+                        slot.payload_length = self.payload_bytes;
+                    }
+                    return .{ .post = .{ .index = value.index, .operation = slot.direction, .payload_length = slot.payload_length } };
                 },
             }
-            // A failure outside the closing drain is a network error, which is how the reference
-            // counts a reset or a refused request even though the socket survives it.
-            if (status != types.error_success and !self.closing) self.statistics.network_errors +%= 1;
-            if (self.closing) return .drop;
-            return classify(operation, status, bytes, capacity);
+        }
+
+        pub fn onCompletion(self: *Engine, index: u32, status: i32, bytes: u32, capacity: u32) Action {
+            self.payload_bytes = capacity;
+            return switch (self.onEvent(.{ .completion = .{ .index = index, .operation = self.direction(index), .status = status, .bytes = bytes } })) {
+                .post => |value| if (value.operation == .receive) .repost_receive else .repost_send,
+                .fatal => .fatal,
+                .none => .drop,
+            };
+        }
+
+        pub fn onPostFailure(self: *Engine) void {
+            self.statistics.network_errors +%= 1;
+            self.failed = true;
+            self.failure = .{ .stage = "UDP post failure", .code = types.error_invalid_data };
+            self.beginClose();
         }
     };
 
-    /// Decides the next step for one completed datagram operation.
-    ///
-    /// A reset is recovered at the receive depth: the slot goes back to receiving without echoing
-    /// anything, which is what keeps a surface that sends an ICMP port-unreachable from draining the
-    /// in-flight depth.
     pub fn classify(operation: types.EngineOperation, status: i32, bytes: u32, capacity: u32) Action {
+        _ = bytes;
+        _ = capacity;
         if (status == types.wsa_econnreset) return .repost_receive;
         if (status != types.error_success) return .fatal;
-        return switch (operation) {
-            .receive => blk: {
-                // A zero-byte datagram is legal and is echoed back as a zero-byte datagram.
-                _ = capacity;
-                _ = bytes;
-                break :blk .repost_send;
-            },
-            .send => .repost_receive,
-        };
+        return if (operation == .receive) .repost_send else .repost_receive;
     }
 
-    /// The datagram bytes a receive produced, clamped to the slot capacity.
     pub fn receiveLength(bytes: u32, capacity: u32) u32 {
         return @min(bytes, capacity);
     }
 
-    /// The datagram runtime: one socket, one completion queue and a fixed in-flight depth. Every
-    /// slot alternates between receiving one datagram and echoing exactly those bytes back, so the
-    /// receive depth the depth switch asks for is restored after every completed exchange.
     pub const runtime = struct {
-        fn failFast(stage: []const u8, native_error: u32) noreturn {
-            native.diagnostics.failFast(stage, native_error);
+        fn failFast(stage: []const u8, code: u32) noreturn {
+            native.diagnostics.failFast(stage, code);
         }
 
-        fn arm(api: *const native.rio.Api, queue: *native.rio.CompletionQueue, overlapped: *c.OVERLAPPED) void {
-            if (queue.armed) failFast("duplicate UDP RIONotify", c.ERROR_INVALID_STATE);
-            overlapped.* = std.mem.zeroes(c.OVERLAPPED);
-            native.guards.requireNotifySuccess(api.notify(queue.value), "RIONotify(UDP)");
-            native.guards.requireTransition(contract.notificationMarkRearmed(&queue.armed), "UDP notification rearm transition");
-        }
+        const Runtime = struct {
+            const allocator = std.heap.page_allocator;
+            api: *const native.rio.Api,
+            capacity: u32,
+            socket_owner: native.socket.Socket = .{},
+            port: native.handle.Handle = .{},
+            arena_value: native.arena.Arena = .{},
+            slot_states: []SlotState = &.{},
+            slots: []Slot = &.{},
+            queue: native.rio.CompletionQueue = .{},
+            request_queue: c.RIO_RQ = c.RIO_INVALID_RQ,
+            notification: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED),
+            engine_value: Engine = .{},
+            snapshot: types.NotifySnapshot = .{},
+            provider_outstanding: u32 = 0,
+            drain_started: ?u64 = null,
 
-        fn payloadView(arena_value: *const native.arena.Arena, index: u32, length: u32) ?c.RIO_BUF {
-            return arena_value.datagramView(index, 0, length);
-        }
-
-        fn postReceive(api: *const native.rio.Api, rq: c.RIO_RQ, arena_value: *const native.arena.Arena, slots: []Slot, index: u32, capacity: u32) bool {
-            var payload = payloadView(arena_value, index, capacity) orelse return false;
-            var remote = arena_value.datagramView(index, capacity, @intCast(types.udp_address_bytes)) orelse return false;
-            if (!api.receiveEx(rq, &payload, &remote, @ptrCast(&slots[index]))) {
-                native.diagnostics.report("RIOReceiveEx(UDP)", @bitCast(c.WSAGetLastError()));
-                return false;
+            fn initializationFailure(self: *Runtime, failure: types.Failure, network_error: bool) native.Result(void) {
+                if (network_error) self.engine_value.statistics.network_errors +%= 1;
+                self.engine_value.failed = true;
+                self.engine_value.failure = failure;
+                self.engine_value.beginClose();
+                return .{ .failure = failure };
             }
-            slots[index].payload = payload;
-            slots[index].remote_address = remote;
 
-            return true;
-        }
-
-        fn postSend(api: *const native.rio.Api, rq: c.RIO_RQ, arena_value: *const native.arena.Arena, slots: []Slot, index: u32, length: u32, capacity: u32) bool {
-            // The datagram length is preserved exactly, including a zero-byte datagram.
-            var payload = payloadView(arena_value, index, length) orelse return false;
-            var remote = arena_value.datagramView(index, capacity, @intCast(types.udp_address_bytes)) orelse return false;
-            if (!api.sendEx(rq, &payload, &remote, @ptrCast(&slots[index]))) {
-                native.diagnostics.report("RIOSendEx(UDP)", @bitCast(c.WSAGetLastError()));
-                return false;
+            fn initialize(self: *Runtime, options: *const types.Options, stride: u32) native.Result(void) {
+                self.socket_owner.value = native.socket.registered(c.SOCK_DGRAM, c.IPPROTO_UDP);
+                if (self.socket_owner.get() == c.INVALID_SOCKET) {
+                    return self.initializationFailure(native.winsockFailure("WSASocketW(UDP RIO)"), true);
+                }
+                if (native.socket.configure(self.socket_owner.get(), options.socket_buffer_bytes, false)) |failure| {
+                    return self.initializationFailure(.{ .stage = failure.stage, .code = failure.native_error }, true);
+                }
+                self.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
+                if (self.port.value == null or self.port.value == c.INVALID_HANDLE_VALUE) {
+                    return self.initializationFailure(native.win32Failure("CreateIoCompletionPort(UDP)"), false);
+                }
+                if (native.endpoint.bindFailure(self.socket_owner.get(), options.port)) |failure| {
+                    return self.initializationFailure(failure, true);
+                }
+                self.arena_value = switch (native.arena.Arena.createResult(self.api, options.udp_depth, stride)) {
+                    .value => |value| value,
+                    .failure => |failure| return self.initializationFailure(failure, failure.domain == .winsock),
+                };
+                self.slot_states = allocator.alloc(SlotState, options.udp_depth) catch
+                    return self.initializationFailure(.{ .stage = "allocate UDP slot states", .code = types.error_not_enough_memory, .domain = .allocation }, false);
+                self.engine_value = Engine.initWithCapacity(self.slot_states, self.capacity);
+                self.slots = allocator.alloc(Slot, options.udp_depth) catch
+                    return self.initializationFailure(.{ .stage = "allocate UDP slots", .code = types.error_not_enough_memory, .domain = .allocation }, false);
+                @memset(self.slots, .{});
+                var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
+                notification.Type = c.RIO_IOCP_COMPLETION;
+                notification.Iocp.IocpHandle = self.port.get();
+                notification.Iocp.CompletionKey = @ptrCast(self.slots.ptr);
+                notification.Iocp.Overlapped = &self.notification;
+                self.queue.reset(self.api, self.api.createCq(options.cq_capacity, &notification));
+                if (!self.queue.valid()) {
+                    return self.initializationFailure(native.winsockFailure("RIOCreateCompletionQueue(UDP)"), true);
+                }
+                self.request_queue = self.api.createRq(self.socket_owner.get(), options.udp_depth, 1, options.udp_depth, 1, self.queue.value, self.queue.value, @ptrCast(self.slots.ptr));
+                if (self.request_queue == c.RIO_INVALID_RQ) {
+                    return self.initializationFailure(native.winsockFailure("RIOCreateRequestQueue(UDP)"), true);
+                }
+                return .{ .value = {} };
             }
-            slots[index].payload = payload;
-            slots[index].remote_address = remote;
 
-            return true;
-        }
+            fn closeSocket(self: *Runtime) void {
+                if (self.drain_started == null) self.drain_started = native.nowMilliseconds();
+                self.socket_owner.deinit();
+            }
 
-        fn validSlot(slots: []const Slot, slot: *const Slot) ?u32 {
-            if (slots.len == 0) return null;
-            const address = @intFromPtr(slot);
-            const start = @intFromPtr(slots.ptr);
-            const end = start + slots.len * @sizeOf(Slot);
-            if (address < start or address >= end) return null;
-            const offset = address - start;
-            if (offset % @sizeOf(Slot) != 0) return null;
-            return @intCast(offset / @sizeOf(Slot));
-        }
+            fn arm(self: *Runtime) void {
+                if (!self.engine_value.hasWork() or self.queue.armed) return;
+                self.notification = std.mem.zeroes(c.OVERLAPPED);
+                native.guards.requireNotifySuccess(self.api.notify(self.queue.value), "RIONotify(UDP)");
+                native.guards.requireTransition(contract.notificationMarkRearmed(&self.queue.armed), "UDP notification rearm transition");
+                self.snapshot.arms +%= 1;
+            }
+
+            fn post(self: *Runtime, value: PostAction) ?types.Failure {
+                if (value.index >= self.slots.len or self.slots[value.index].provider_operation != null or
+                    self.provider_outstanding != self.engine_value.outstanding)
+                {
+                    return types.Failure.invariant("UDP post ownership");
+                }
+                var payload = self.arena_value.datagramView(value.index, 0, value.payload_length) orelse
+                    return types.Failure.invariant("UDP payload registration extent");
+                var remote = self.arena_value.datagramView(value.index, self.capacity, @intCast(types.udp_address_bytes)) orelse
+                    return types.Failure.invariant("UDP address registration extent");
+                const context_value: ?*anyopaque = @ptrCast(&self.slots[value.index]);
+                const submitted_length = payload.Length;
+                const accepted = switch (value.operation) {
+                    .receive => self.api.receiveEx(self.request_queue, &payload, &remote, context_value),
+                    .send => self.api.sendEx(self.request_queue, &payload, &remote, context_value),
+                };
+                if (!accepted) return native.winsockFailure(if (value.operation == .receive) "RIOReceiveEx(UDP)" else "RIOSendEx(UDP)");
+                self.slots[value.index].payload = payload;
+                self.slots[value.index].remote_address = remote;
+                self.slots[value.index].provider_operation = value.operation;
+                self.slots[value.index].posted_length = submitted_length;
+                self.provider_outstanding += 1;
+                native.guards.requireTransition(self.engine_value.markPosted(value.index), "UDP post ownership");
+                return null;
+            }
+
+            fn execute(self: *Runtime, action: UdpAction) void {
+                switch (action) {
+                    .post => |value| {
+                        if (self.post(value)) |failure| {
+                            if (failure.classification == .internal) failFast(failure.stage, @bitCast(failure.code));
+                            self.execute(self.engine_value.onEvent(.{ .post_failed = .{ .index = value.index, .failure = failure } }));
+                        }
+                    },
+                    .fatal => |value| {
+                        if (value.failure.classification == .internal) failFast(value.failure.stage, @bitCast(value.failure.code));
+                        native.diagnostics.reportFailure(value.failure);
+                        self.closeSocket();
+                    },
+                    .none => if (self.engine_value.closing) self.closeSocket(),
+                }
+            }
+
+            fn processResult(self: *Runtime, result: c.RIORESULT) void {
+                const raw = result.RequestContext orelse failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);
+                const index = self.completionIndex(@intFromPtr(raw));
+                const operation = self.slots[index].provider_operation.?;
+                if (result.BytesTransferred > self.slots[index].posted_length) {
+                    failFast("UDP completion payload extent", c.ERROR_INVALID_DATA);
+                }
+                // Retire the native provider ownership before publishing the business event.
+                self.slots[index].provider_operation = null;
+                self.provider_outstanding -= 1;
+                self.execute(self.engine_value.onEvent(.{ .completion = .{ .index = index, .operation = operation, .status = result.Status, .bytes = result.BytesTransferred } }));
+            }
+
+            /// CQ records can be queued before their pending notification reaches IOCP. This pass
+            /// preserves notification ownership and allows even one-record short dequeues to drain.
+            fn drain(self: *Runtime, record_budget: u32) void {
+                var results: [types.completion_batch_size]c.RIORESULT = undefined;
+                var remaining = record_budget;
+                while (remaining != 0) {
+                    const requested = @min(types.completion_batch_size, remaining);
+                    const count = native.guards.requireDequeueCount(self.api.dequeue(self.queue.value, &results, requested), requested, "RIODequeueCompletion(UDP)");
+                    if (count == 0) return;
+                    remaining -= count;
+                    for (results[0..count]) |result| self.processResult(result);
+                }
+            }
+
+            fn completionIndex(self: *const Runtime, address: usize) u32 {
+                const base = @intFromPtr(self.slots.ptr);
+                const extent = self.slots.len * @sizeOf(Slot);
+                const end = types.checkedAdd(usize, base, extent) orelse failFast("UDP completion identity", c.ERROR_INVALID_DATA);
+                if (address < base or address >= end or (address - base) % @sizeOf(Slot) != 0) {
+                    failFast("UDP completion identity", c.ERROR_INVALID_DATA);
+                }
+                const index: u32 = @intCast((address - base) / @sizeOf(Slot));
+                if (self.provider_outstanding == 0 or self.slots[index].provider_operation == null or
+                    self.provider_outstanding != self.engine_value.outstanding or
+                    !self.engine_value.slots[index].outstanding or
+                    self.slots[index].provider_operation.? != self.engine_value.direction(index))
+                {
+                    failFast("UDP completion invariant", c.ERROR_INVALID_DATA);
+                }
+                return index;
+            }
+
+            /// Guard is inside the release function; every initialization and terminal caller shares it.
+            fn deinit(self: *Runtime) void {
+                if (self.provider_outstanding != 0 or self.engine_value.outstanding != 0) failFast("UDP cleanup with outstanding operations", c.ERROR_IO_INCOMPLETE);
+                for (self.slots) |slot| {
+                    if (slot.provider_operation != null) failFast("UDP cleanup with outstanding operations", c.ERROR_IO_INCOMPLETE);
+                }
+                self.socket_owner.deinit();
+                self.queue.deinit();
+                self.arena_value.deinit();
+                if (self.slots.len != 0) allocator.free(self.slots);
+                if (self.slot_states.len != 0) allocator.free(self.slot_states);
+                self.slots = &.{};
+                self.slot_states = &.{};
+                self.engine_value.slots = &.{};
+                self.port.deinit();
+            }
+
+            fn finish(self: *Runtime, options: *const types.Options, start: u64) types.ExitCode {
+                if (options.stats) {
+                    var buffer: [512]u8 = undefined;
+                    const line = self.engine_value.statistics.writeFinalLine(.udp, native.nowMilliseconds() - start, 1, self.engine_value.outstanding, &buffer) orelse failFast("format UDP statistics", c.ERROR_INSUFFICIENT_BUFFER);
+                    if (!native.diagnostics.writeStdout(line)) failFast("write UDP statistics", c.GetLastError());
+                }
+                const failed = self.engine_value.failed;
+                self.deinit();
+                native.diagnostics.writeSnapshots(&.{self.snapshot}, .udp);
+                return if (failed) .network else .success;
+            }
+        };
 
         pub fn run(api: *const native.rio.Api, options: *const types.Options, stop: *std.atomic.Value(bool)) types.ExitCode {
-            const allocator = std.heap.page_allocator;
             const capacity = options.rio_buffer_bytes;
             const stride = native.arena.udpStride(capacity) orelse {
-                native.diagnostics.report("UDP slot stride", c.ERROR_ARITHMETIC_OVERFLOW);
-                return .network;
+                native.diagnostics.report("UDP slot stride", c.ERROR_NOT_ENOUGH_MEMORY);
+                return .usage;
             };
-            // Each datagram slot reserves one queue entry per direction, so the depth may never
-            // exceed half the completion queue. The parser already refuses a larger depth; this is
-            // the last line of defence for a caller that built its own options.
-            if (options.udp_depth == 0 or options.udp_depth > options.cq_capacity / 2) {
-                native.diagnostics.report("UDP queue capacity", c.ERROR_INSUFFICIENT_BUFFER);
-                return .network;
+            const arena_bytes = contract.checkedPageRoundedArenaBytes(options.udp_depth, stride, options.memory_bytes, native.pageBytes()) orelse 0;
+            if (options.udp_depth == 0 or options.udp_depth > options.cq_capacity / 2 or arena_bytes == 0 or arena_bytes > std.math.maxInt(u32)) {
+                native.diagnostics.report("UDP queue/arena capacity", c.ERROR_NOT_ENOUGH_MEMORY);
+                return .usage;
             }
-
-            var socket_owner = native.socket.Socket{ .value = native.socket.registered(c.SOCK_DGRAM, c.IPPROTO_UDP) };
-            defer socket_owner.deinit();
-            if (socket_owner.get() == c.INVALID_SOCKET) {
-                native.diagnostics.report("WSASocketW(UDP RIO)", @bitCast(c.WSAGetLastError()));
-                return .network;
+            var value = Runtime{ .api = api, .capacity = capacity };
+            defer value.deinit();
+            switch (value.initialize(options, stride)) {
+                .value => {},
+                .failure => |failure| {
+                    native.diagnostics.reportFailure(failure);
+                    _ = value.engine_value.onEvent(.drained);
+                    return value.finish(options, native.nowMilliseconds());
+                },
             }
-            if (native.socket.configure(socket_owner.get(), options.socket_buffer_bytes, false)) |failure| {
-            native.diagnostics.report(failure.stage, @bitCast(failure.native_error));
-            return .network;
-        }
-
-            var port = native.handle.Handle{};
-            defer port.deinit();
-            port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
-            if (port.value == null or port.value == c.INVALID_HANDLE_VALUE) {
-                native.diagnostics.report("CreateIoCompletionPort(UDP)", c.GetLastError());
-                return .network;
-            }
-            if (!native.endpoint.bindEndpoint(socket_owner.get(), options.port)) return .network;
-
-            var arena_value = native.arena.Arena.create(api, options.udp_depth, stride) catch |failure| {
-                native.diagnostics.report("UDP registered arena", c.ERROR_NOT_ENOUGH_MEMORY);
-                return switch (failure) {
-                    error.Registration => .network,
-                    else => .network,
-                };
-            };
-            defer arena_value.deinit();
-
-            const slot_states = allocator.alloc(SlotState, options.udp_depth) catch {
-                native.diagnostics.report("allocate UDP slot states", c.ERROR_NOT_ENOUGH_MEMORY);
-                return .network;
-            };
-            defer allocator.free(slot_states);
-            const slots = allocator.alloc(Slot, options.udp_depth) catch {
-                native.diagnostics.report("allocate UDP slots", c.ERROR_NOT_ENOUGH_MEMORY);
-                return .network;
-            };
-            defer allocator.free(slots);
-            @memset(slots, .{});
-
-            var notification_overlapped: c.OVERLAPPED = std.mem.zeroes(c.OVERLAPPED);
-            var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
-            notification.Type = c.RIO_IOCP_COMPLETION;
-            notification.Iocp.IocpHandle = port.get();
-            notification.Iocp.CompletionKey = @ptrCast(slots.ptr);
-            notification.Iocp.Overlapped = &notification_overlapped;
-
-            var queue = native.rio.CompletionQueue{};
-            defer queue.deinit();
-            queue.reset(api, api.createCq(options.cq_capacity, &notification));
-            if (!queue.valid()) {
-                native.diagnostics.report("RIOCreateCompletionQueue(UDP)", @bitCast(c.WSAGetLastError()));
-                return .network;
-            }
-
-            const request_queue = api.createRq(
-                socket_owner.get(),
-                options.udp_depth,
-                1,
-                options.udp_depth,
-                1,
-                queue.value,
-                queue.value,
-                null,
-            );
-            if (request_queue == c.RIO_INVALID_RQ) {
-                native.diagnostics.report("RIOCreateRequestQueue(UDP)", @bitCast(c.WSAGetLastError()));
-                return .network;
-            }
-
-            var engine_value = Engine.init(slot_states);
-            var failed = false;
             for (0..options.udp_depth) |position| {
-                const index: u32 = @intCast(position);
-                if (!postReceive(api, request_queue, &arena_value, slots, index, capacity)) {
-                    engine_value.onPostFailure();
-                    failed = true;
-                    break;
-                }
-                native.guards.requireTransition(engine_value.onPosted(index, .receive), "UDP post ownership");
+                value.execute(value.engine_value.initialPost(@intCast(position)));
+                if (value.engine_value.failed) break;
             }
-            if (!engine_value.hasWork()) {
-                // The depth could not even be armed once, so nothing can make progress.
-                socket_owner.deinit();
-                return .network;
-            }
-
-            if (failed) engine_value.beginClose();
-            if (engine_value.closing) socket_owner.deinit();
-            if (!engine_value.closing) arm(api, &queue, &notification_overlapped);
             const start = native.nowMilliseconds();
+            value.arm();
             var results: [types.completion_batch_size]c.RIORESULT = undefined;
-
-            while (!engine_value.closing or !engine_value.mayRelease()) {
-                if (!engine_value.closing and (stop.load(.acquire) or
-                    (options.run_seconds != 0 and native.nowMilliseconds() - start >= @as(u64, options.run_seconds) * 1000)))
+            var expired_packets: u32 = 0;
+            while (!value.engine_value.closing or value.engine_value.hasWork()) {
+                const now = native.nowMilliseconds();
+                if (!value.engine_value.closing and (stop.load(.acquire) or
+                    (options.run_seconds != 0 and now - start >= @as(u64, options.run_seconds) * 1000)))
                 {
-                    engine_value.beginClose();
-                    socket_owner.deinit();
+                    value.execute(value.engine_value.onEvent(.stop));
                 }
-                const packet = native.rio.getQueuedCompletionStatus(port.get(), 100);
-                if (packet.overlapped == &notification_overlapped) {
+                const drain_due = if (value.drain_started) |started|
+                    now -| started >= types.drain_milliseconds
+                else
+                    false;
+                value.arm(); // Closing cancels work; it never cancels its completion notification.
+                const packet = native.rio.getQueuedCompletionStatus(value.port.get(), if (drain_due) 0 else 100);
+                const queued_record = packet.ok or packet.overlapped != null or packet.key != 0;
+                if (packet.overlapped == &value.notification) {
                     if (!packet.ok) failFast("GetQueuedCompletionStatus(UDP notification)", packet.native_error);
-                    if (packet.key != @intFromPtr(slots.ptr)) failFast("UDP RIO notification key", c.ERROR_INVALID_DATA);
-                    native.guards.requireTransition(contract.notificationMarkDelivered(&queue.armed), "UDP notification delivery transition");
+                    if (packet.key != @intFromPtr(value.slots.ptr)) failFast("UDP RIO notification key", c.ERROR_INVALID_DATA);
+                    native.guards.requireTransition(contract.notificationMarkDelivered(&value.queue.armed), "UDP notification delivery transition");
+                    value.snapshot.deliveries +%= 1;
                     var batches: u32 = 0;
                     while (batches < types.completion_drain_batches) : (batches += 1) {
-                        const count = native.guards.requireDequeueCount(
-                            api.dequeue(queue.value, &results, types.completion_batch_size),
-                            types.completion_batch_size,
-                            "RIODequeueCompletion(UDP)",
-                        );
-                        if (count == 0) break;
-                        for (results[0..count]) |result| {
-                            const raw = result.RequestContext orelse failFast("UDP null RequestContext", c.ERROR_INVALID_DATA);
-                            const slot: *Slot = @ptrCast(@alignCast(raw));
-                            const index = validSlot(slots, slot) orelse failFast("UDP completion identity", c.ERROR_INVALID_DATA);
-                            switch (engine_value.onCompletion(index, result.Status, result.BytesTransferred, capacity)) {
-                                .repost_receive => {
-                                    if (!postReceive(api, request_queue, &arena_value, slots, index, capacity)) {
-                                        native.diagnostics.report("UDP receive repost", @intCast(c.WSAGetLastError()));
-                                        engine_value.onPostFailure();
-                                        failed = true;
-                                        engine_value.beginClose();
-                                        socket_owner.deinit();
-                                        continue;
-                                    }
-                                    native.guards.requireTransition(engine_value.onPosted(index, .receive), "UDP post ownership");
-                                },
-                                .repost_send => {
-                                    // The datagram length is kept exactly, so a zero-byte datagram is
-                                    // echoed as a zero-byte datagram.
-                                    const length = receiveLength(result.BytesTransferred, capacity);
-                                    if (!postSend(api, request_queue, &arena_value, slots, index, length, capacity)) {
-                                        native.diagnostics.report("UDP send repost", @intCast(c.WSAGetLastError()));
-                                        engine_value.onPostFailure();
-                                        failed = true;
-                                        engine_value.beginClose();
-                                        socket_owner.deinit();
-                                        continue;
-                                    }
-                                    native.guards.requireTransition(engine_value.onPosted(index, .send), "UDP post ownership");
-                                },
-                                .drop => {},
-                                .fatal => {
-                                    native.diagnostics.report("UDP RIO completion", @bitCast(result.Status));
-                                    failed = true;
-                                    engine_value.beginClose();
-                                    socket_owner.deinit();
-                                },
-                            }
+                        if (!value.engine_value.closing and (stop.load(.acquire) or
+                            (options.run_seconds != 0 and native.nowMilliseconds() - start >= @as(u64, options.run_seconds) * 1000)))
+                        {
+                            value.execute(value.engine_value.onEvent(.stop));
                         }
+                        const count = native.guards.requireDequeueCount(value.api.dequeue(value.queue.value, &results, types.completion_batch_size), types.completion_batch_size, "RIODequeueCompletion(UDP)");
+                        if (count == 0) break;
+                        for (results[0..count]) |result| value.processResult(result);
                     }
-                    if (engine_value.hasWork() and !engine_value.closing) arm(api, &queue, &notification_overlapped);
+                    value.arm();
+                } else if (!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null) {
+                    if (!value.engine_value.closing and value.engine_value.hasWork() and !value.queue.armed) value.snapshot.timeout_wakeups +%= 1;
                 } else if (!packet.ok and packet.native_error != c.WAIT_TIMEOUT) {
                     failFast("GetQueuedCompletionStatus(UDP)", packet.native_error);
-                } else if (!(!packet.ok and packet.native_error == c.WAIT_TIMEOUT and packet.overlapped == null)) {
-                    failFast("unexpected UDP IOCP packet", c.ERROR_INVALID_DATA);
-                }
+                } else failFast("unexpected UDP IOCP packet", c.ERROR_INVALID_DATA);
+                const expired = if (value.drain_started) |started|
+                    native.nowMilliseconds() - started >= types.drain_milliseconds
+                else
+                    false;
+                if (expired and value.engine_value.hasWork()) {
+                    if (queued_record and expired_packets < options.udp_depth + 1) {
+                        expired_packets += 1;
+                        continue;
+                    }
+                    value.drain(options.udp_depth);
+                    value.arm();
+                    if (value.engine_value.hasWork()) failFast("UDP drain deadline", c.ERROR_TIMEOUT);
+                } else expired_packets = 0;
             }
-
-            // Every posted datagram has retired, so the registered storage can be released.
-            native.guards.requireTransition(types.udpMayRelease(.stopped, engine_value.outstanding), "UDP CQ retirement with outstanding operations");
-            queue.deinit();
-
-            if (options.stats) {
-                var buffer: [512]u8 = undefined;
-                const line = engine_value.statistics.writeFinalLine(.udp, native.nowMilliseconds() - start, 1, engine_value.outstanding, &buffer) orelse
-                    failFast("format UDP statistics", c.ERROR_INSUFFICIENT_BUFFER);
-                if (!native.diagnostics.writeStdout(line)) failFast("write UDP statistics", c.GetLastError());
-            }
-            return if (failed) .network else .success;
+            value.execute(value.engine_value.onEvent(.drained));
+            if (!value.engine_value.mayRelease()) failFast("UDP release precondition", c.ERROR_INVALID_DATA);
+            if (!value.snapshot.valid()) failFast("UDP notification accounting", c.ERROR_INVALID_STATE);
+            return value.finish(options, start);
         }
     };
 };

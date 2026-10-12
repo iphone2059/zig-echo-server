@@ -107,7 +107,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     var initialized: u32 = 0;
     var started_workers: u32 = 0;
     for (workers, 0..) |*wrk, position| {
-        tcp.initialize(
+        switch (tcp.initializeResult(
             wrk,
             api,
             options,
@@ -115,10 +115,14 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
             @intCast(position),
             credits[position].capacity,
             &credits[position],
-        ) catch {
-            failed.store(true, .release);
-            break;
-        };
+        )) {
+            .value => {},
+            .failure => |failure| {
+                native.diagnostics.reportFailure(failure);
+                failed.store(true, .release);
+                break;
+            },
+        }
         // Two different counts: initialized is the cleanup scope -- workers whose storage exists and
         // must be released -- while started_workers is the threads that actually run, which is what the
         // reference reports.
@@ -144,12 +148,15 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     var acceptor_published = false;
     var startup_network_errors: u64 = 0;
     if (!failed.load(.acquire)) {
-        acceptor.initialize(&acceptor_value, api, options, workers[0..initialized], credits[0..initialized], &failed) catch {
-            // A listener, bind/listen, IOCP or extension failure is a network error even though no
-            // acceptor thread ever started, which is how the reference counts it.
-            startup_network_errors +%= 1;
-            failed.store(true, .release);
-        };
+        switch (acceptor.initializeResult(&acceptor_value, api, options, workers[0..initialized], credits[0..initialized], &failed)) {
+            .value => {},
+            .failure => |failure| {
+                native.diagnostics.reportFailure(failure);
+                // Listener startup failures count even when no acceptor thread was created.
+                if (failure.domain != .allocation) startup_network_errors +%= 1;
+                failed.store(true, .release);
+            },
+        }
         if (!failed.load(.acquire)) {
             acceptor_published = acceptor.start(&acceptor_value);
             if (!acceptor_published) failed.store(true, .release);
@@ -170,7 +177,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     // running while the deferred release below frees its storage, its completion queue and its
     // registered memory is exactly the dangling ownership this barrier exists to prevent.
     if (acceptor_published) acceptor.stop(&acceptor_value);
-    acceptor.destroy(&acceptor_value);
+    acceptor.join(&acceptor_value);
     if (!shutdown.advance(.acceptor_stopped)) native.diagnostics.failFast("TCP shutdown acceptor order", c.ERROR_INVALID_STATE);
 
     // The coordinator owns the admission barrier; the acceptor publishes nothing on its way out. A
@@ -185,20 +192,28 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
     statistics.rejected +%= acceptor_value.core.rejected;
     statistics.network_errors +%= acceptor_value.core.network_errors +% startup_network_errors;
     var fatal = failed.load(.acquire);
+    // Join the whole set before inspecting any release invariant.
+    for (workers[0..initialized]) |*wrk| tcp.join(wrk);
+    if (!shutdown.advance(.joined)) native.diagnostics.failFast("TCP shutdown join order", c.ERROR_INVALID_STATE);
+    acceptor.requireRelease(&acceptor_value);
+    var snapshots: [types.maximum_workers]types.NotifySnapshot = undefined;
+    var snapshot_count: usize = 0;
     for (workers[0..initialized]) |*wrk| {
-        const running = wrk.thread.value != null;
-        tcp.join(wrk);
-        // Every thread is stopped now, so the worker's own accounting is quiescent and may be read.
-        requireWorkerRelease(running, wrk.engine_value.mayExit());
+        tcp.requireRelease(wrk);
         statistics.merge(&wrk.engine_value.statistics);
         if (wrk.engine_value.fatal) fatal = true;
+        if (wrk.ready) {
+            snapshots[snapshot_count] = .{ .worker = wrk.worker_index, .arms = wrk.notification_arms, .deliveries = wrk.notification_deliveries, .timeout_wakeups = wrk.timeout_wakeups };
+            snapshot_count += 1;
+        }
     }
-    if (!shutdown.advance(.joined)) native.diagnostics.failFast("TCP shutdown join order", c.ERROR_INVALID_STATE);
 
-    // The acceptor proves its own ownership at its release boundary, and the worker guard above has
-    // already run for every joined thread, so nothing below can free memory Windows can still reach.
+    // Every thread joined before the acceptor and worker ownership guards above. Each release
+    // repeats its own guard, so no caller can free memory Windows can still reach.
     // Phase three: release, then assert the accounting that no longer implies native ownership.
+    acceptor.destroy(&acceptor_value);
     for (workers[0..initialized]) |*wrk| tcp.destroy(wrk);
+    native.diagnostics.writeSnapshots(snapshots[0..snapshot_count], .tcp);
     for (credits) |*credit| {
         if (!credit.isFull()) return reportAndFail("TCP acceptor terminal handoffs", c.ERROR_IO_INCOMPLETE);
     }
@@ -210,17 +225,26 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
             return reportAndFail("format TCP statistics", c.ERROR_INSUFFICIENT_BUFFER);
         if (!native.diagnostics.writeStdout(line)) return reportAndFail("write TCP statistics", c.GetLastError());
     }
-    return if (fatal) .network else .success;
+    return if (fatal or failed.load(.acquire)) .network else .success;
 }
 
 pub fn runServer(options: *const types.Options) types.ExitCode {
     clearControl();
-    var winsock = native.winsock.Winsock.init() catch {
-        native.diagnostics.report("WSAStartup", @intCast(c.WSAGetLastError()));
-        return .network;
+    var winsock = switch (native.winsock.Winsock.initResult()) {
+        .value => |value| value,
+        .failure => |failure| {
+            native.diagnostics.reportFailure(failure);
+            return .network;
+        },
     };
     defer winsock.deinit();
-    const api = native.rio.Api.load() catch return .network;
+    const api = switch (native.rio.Api.loadResult()) {
+        .value => |value| value,
+        .failure => |failure| {
+            native.diagnostics.reportFailure(failure);
+            return .network;
+        },
+    };
     return switch (options.protocol) {
         .tcp => runTcp(&api, options),
         .udp => internal.udp.runtime.run(&api, options, &stop_requested),

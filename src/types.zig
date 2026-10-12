@@ -56,6 +56,8 @@ pub const error_invalid_data: i32 = 13;
 pub const error_netname_deleted: u32 = 64;
 pub const error_io_incomplete: i32 = 996;
 pub const error_io_pending: i32 = 997;
+pub const error_timeout: i32 = 1460;
+pub const drain_milliseconds: u64 = 5_000;
 pub const wsa_econnaborted: i32 = 10_053;
 pub const wsa_econnreset: i32 = 10_054;
 pub const wait_object_0: u32 = 0;
@@ -122,6 +124,40 @@ pub fn udpMayRelease(phase: UdpPhase, outstanding: u32) bool {
 /// What a completion belongs to. The operation travels in the RIO request context, so a completion
 /// for a connection that was already closed is still classified correctly.
 pub const EngineOperation = enum(u8) { receive, send };
+
+pub const ErrorDomain = enum(u8) { win32, winsock, allocation, invariant };
+pub const ErrorClass = enum(u8) { usage, network, internal };
+
+/// Captured at the failing call, before reporting or cleanup can replace last-error.
+pub const Failure = struct {
+    stage: []const u8,
+    code: i32,
+    domain: ErrorDomain = .winsock,
+    classification: ErrorClass = .network,
+
+    pub fn invariant(stage: []const u8) Failure {
+        return .{ .stage = stage, .code = error_invalid_data, .domain = .invariant, .classification = .internal };
+    }
+};
+
+/// A normalized completion. Runtime proves identity before publishing it to an engine.
+pub const Completion = struct {
+    index: u32,
+    operation: EngineOperation,
+    status: i32,
+    bytes: u32,
+};
+
+pub const UdpLifecycle = struct {
+    phase: UdpPhase,
+    outstanding: u32,
+    closing: bool,
+    failed: bool,
+
+    pub fn mayRelease(self: UdpLifecycle) bool {
+        return udpMayRelease(self.phase, self.outstanding);
+    }
+};
 
 /// Counters accumulated by one worker (TCP) or by the single UDP engine.
 pub const Statistics = struct {
@@ -200,6 +236,10 @@ pub const NotifySnapshot = struct {
 
     pub fn valid(self: *const NotifySnapshot) bool {
         return self.timeout_wakeups == 0 and self.arms >= self.deliveries and self.arms - self.deliveries <= 1;
+    }
+
+    pub fn writeLine(self: *const NotifySnapshot, protocol: Protocol, buffer: []u8) ?[]const u8 {
+        return std.fmt.bufPrint(buffer, "role=server protocol={s} worker={d} notify_arms={d} notify_deliveries={d} notify_gap={d} timeout_wakeups_while_outstanding={d}\n", .{ if (protocol == .udp) "udp" else "tcp", self.worker, self.arms, self.deliveries, self.arms -| self.deliveries, self.timeout_wakeups }) catch null;
     }
 };
 
