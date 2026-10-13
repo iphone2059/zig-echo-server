@@ -960,19 +960,19 @@ pub const endpoint = struct {
     }
 
     pub fn acceptExtension(listener: c.SOCKET) ?c.LPFN_ACCEPTEX {
-        return loadExtension(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "load AcceptEx");
+        return loadExtension(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "SIO_GET_EXTENSION_FUNCTION_POINTER(AcceptEx)");
     }
 
     pub fn acceptExtensionResult(listener: c.SOCKET) Result(c.LPFN_ACCEPTEX) {
-        return loadExtensionResult(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "load AcceptEx");
+        return loadExtensionResult(c.LPFN_ACCEPTEX, listener, c.WSAID_ACCEPTEX, "SIO_GET_EXTENSION_FUNCTION_POINTER(AcceptEx)");
     }
 
     pub fn acceptAddressesExtension(listener: c.SOCKET) ?c.LPFN_GETACCEPTEXSOCKADDRS {
-        return loadExtension(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs");
+        return loadExtension(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "SIO_GET_EXTENSION_FUNCTION_POINTER(GetAcceptExSockaddrs)");
     }
 
     pub fn acceptAddressesExtensionResult(listener: c.SOCKET) Result(c.LPFN_GETACCEPTEXSOCKADDRS) {
-        return loadExtensionResult(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "load GetAcceptExSockaddrs");
+        return loadExtensionResult(c.LPFN_GETACCEPTEXSOCKADDRS, listener, c.WSAID_GETACCEPTEXSOCKADDRS, "SIO_GET_EXTENSION_FUNCTION_POINTER(GetAcceptExSockaddrs)");
     }
 };
 

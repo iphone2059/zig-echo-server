@@ -96,7 +96,7 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
         return reportAndFail("worker array allocation", c.ERROR_NOT_ENOUGH_MEMORY);
     defer allocator.free(workers);
     const credits = allocator.alloc(acceptor.AdmissionCredits, worker_count) catch
-        return reportAndFail("worker credit allocation", c.ERROR_NOT_ENOUGH_MEMORY);
+        return reportAndFail("worker array allocation", c.ERROR_NOT_ENOUGH_MEMORY);
     defer allocator.free(credits);
     for (workers) |*wrk| wrk.* = .{};
     for (credits, 0..) |*credit, position| {
@@ -137,11 +137,12 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
                 break;
             }
         }
-        if (!tcp.start(wrk)) {
+        const started = tcp.start(wrk);
+        if (wrk.thread.value != null) started_workers += 1;
+        if (!started) {
             failed.store(true, .release);
             break;
         }
-        started_workers += 1;
     }
 
     var acceptor_value: acceptor.Acceptor = .{};
@@ -182,10 +183,14 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
 
     // The coordinator owns the admission barrier; the acceptor publishes nothing on its way out. A
     // run whose acceptor never started still has to close admission for the workers it did start.
-    for (workers[0..initialized]) |*wrk| tcp.postAdmissionClosed(wrk);
+    for (workers[0..initialized]) |*wrk| {
+        if (wrk.thread.value != null) tcp.postAdmissionClosed(wrk);
+    }
     if (!shutdown.advance(.admission_closed)) native.diagnostics.failFast("TCP shutdown admission order", c.ERROR_INVALID_STATE);
 
-    for (workers[0..initialized]) |*wrk| tcp.postStop(wrk);
+    for (workers[0..initialized]) |*wrk| {
+        if (wrk.thread.value != null) tcp.postStop(wrk);
+    }
     if (!shutdown.advance(.workers_stopped)) native.diagnostics.failFast("TCP shutdown worker order", c.ERROR_INVALID_STATE);
 
     var statistics = types.Statistics{};
@@ -223,13 +228,12 @@ fn runTcp(api: *const native.rio.Api, options: *const types.Options) types.ExitC
         var buffer: [512]u8 = undefined;
         const line = statistics.writeFinalLine(.tcp, native.nowMilliseconds() - start, started_workers, outstanding, &buffer) orelse
             return reportAndFail("format TCP statistics", c.ERROR_INSUFFICIENT_BUFFER);
-        if (!native.diagnostics.writeStdout(line)) return reportAndFail("write TCP statistics", c.GetLastError());
+        _ = native.diagnostics.writeStdout(line);
     }
     return if (fatal or failed.load(.acquire)) .network else .success;
 }
 
 pub fn runServer(options: *const types.Options) types.ExitCode {
-    clearControl();
     var winsock = switch (native.winsock.Winsock.initResult()) {
         .value => |value| value,
         .failure => |failure| {

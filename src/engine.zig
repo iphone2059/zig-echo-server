@@ -38,6 +38,7 @@ pub const InitError = error{ Capacity, Allocation, TimerHeap };
 pub const Event = union(enum) {
     completion: struct { value: types.Completion, now: u64 },
     post_failed: u32,
+    post_rejected: struct { index: u32, failure: types.Failure },
     timeout: u64,
     stop: u64,
     admission_closed,
@@ -103,6 +104,7 @@ pub const TcpEngine = struct {
         const decision: ?Step = switch (event) {
             .completion => |value| self.onCompletion(value.value.index, value.value.operation, value.value.status, value.value.bytes, value.now),
             .post_failed => |index| self.onPostFailure(index),
+            .post_rejected => |value| self.onPostRejected(value.index, value.failure),
             .timeout => |now| return self.onTimeout(now, steps),
             .stop => |now| return self.beginStopAt(now, steps),
             .admission_closed => {
@@ -267,6 +269,17 @@ pub const TcpEngine = struct {
         // so the count has to come back down before the close.
         connection.outstanding -|= 1;
         return self.apply(index, connection.close());
+    }
+
+    pub fn onPostRejected(self: *TcpEngine, index: u32, failure: types.Failure) ?Step {
+        if (failure.classification != .network) {
+            self.fatal = true;
+            self.failure = failure;
+            return null;
+        }
+        const step = self.onPostFailure(index);
+        if (!self.fatal) self.failure = failure;
+        return step;
     }
 
     /// Closes every connection whose deadline passed. The releases that were possible immediately

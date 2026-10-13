@@ -30,10 +30,14 @@ pub const tokens = struct {
 
 /// Usage text, printed on stdout for a valid help command line and on stderr for a usage error.
 pub const usage =
-    "Usage: zig-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]\n" ++
-    "       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]\n" ++
-    "       [/cq capacity] [/memory bytes] [/q] [/stats]\n" ++
-    "Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.\n";
+    "Usage: zig-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds] [/b bytes]\n" ++
+    "       [/k depth] [/threads workers] [/rio-buffer bytes]\n" ++
+    "       [/cq capacity] [/memory bytes] [/q] [/stats] [/h]\n" ++
+    "/t seconds: TCP idle timeout; UDP rejects /t.\n" ++
+    "/k depth: UDP receive slots; TCP rejects /k.\n" ++
+    "/threads 0: automatic TCP workers, min(active processors, 64); UDP uses 1.\n" ++
+    "/w 0: no run limit. /memory bounds page-rounded registered arenas.\n" ++
+    "/q suppresses nonessential output; /stats prints final; /h shows help.\n";
 
 /// Which protocol a switch belongs to; the parser rejects a switch used with the wrong one.
 pub const Scope = enum { both, tcp_only, udp_only };
@@ -337,25 +341,33 @@ pub fn parseArgs(argv: []const []const u8, out: *types.Options, error_buffer: []
 
 pub fn parseProcessArgs(
     args: std.process.Args,
-    allocator: std.mem.Allocator,
     out: *types.Options,
     error_buffer: []u8,
 ) bool {
-    var iterator = args.iterateAllocator(allocator) catch return fail(error_buffer, "unable to read command line");
+    // Windows bounds command lines to 32,767 UTF-16 units including NUL. WTF-8
+    // needs at most three bytes per unit, and every argument after argv[0] consumes
+    // at least one character and a separator. The CRT-compatible iterator and its
+    // borrowed views therefore fit in bounded stack storage without a heap failure.
+    const command_line_capacity = 32_768;
+    if (args.vector.len > command_line_capacity) return fail(error_buffer, "invalid parser arguments");
+    var bytes: [command_line_capacity * 3 + 1]u8 = undefined;
+    var storage = std.heap.FixedBufferAllocator.init(&bytes);
+    var iterator = args.iterateAllocator(storage.allocator()) catch
+        native.diagnostics.failFast("command line storage", native.sdk.c.ERROR_INSUFFICIENT_BUFFER);
     defer iterator.deinit();
-    var owned: std.ArrayList([]u8) = .empty;
-    defer {
-        for (owned.items) |argument| allocator.free(argument);
-        owned.deinit(allocator);
-    }
+    var argv: [command_line_capacity / 2 + 1][]const u8 = undefined;
+    var count: usize = 0;
     while (iterator.next()) |argument| {
-        const copy = allocator.dupe(u8, argument) catch return fail(error_buffer, "out of memory while parsing arguments");
-        owned.append(allocator, copy) catch {
-            allocator.free(copy);
-            return fail(error_buffer, "out of memory while parsing arguments");
-        };
+        if (count == argv.len) native.diagnostics.failFast("command line argument count", native.sdk.c.ERROR_INSUFFICIENT_BUFFER);
+        argv[count] = argument;
+        count += 1;
     }
-    return parseArgs(owned.items, out, error_buffer);
+    // C++ receives a synthesized executable name even for an empty command line.
+    if (count == 0) {
+        argv[0] = "";
+        count = 1;
+    }
+    return parseArgs(argv[0..count], out, error_buffer);
 }
 
 test "checked arithmetic and page rounding" {

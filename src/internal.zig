@@ -326,6 +326,17 @@ pub const worker = struct {
             if (index < wrk.request_queues.len) wrk.request_queues[index] = c.RIO_INVALID_RQ;
         }
 
+        fn releaseSlot(wrk: *Worker, index: u32) void {
+            if (index >= wrk.provider_requests.len or index >= wrk.connection_sockets.len or index >= wrk.request_queues.len) {
+                failFast("TCP connection release index", c.ERROR_INVALID_DATA);
+            }
+            if (wrk.provider_requests[index].operation != null) {
+                failFast("TCP connection release precondition", c.ERROR_IO_INCOMPLETE);
+            }
+            closeSocket(wrk, index);
+            wrk.credits.?.release();
+        }
+
         fn arm(wrk: *Worker) void {
             if (wrk.completion_queue.armed) failFast("duplicate worker RIONotify", c.ERROR_INVALID_STATE);
             wrk.notification_overlapped = std.mem.zeroes(c.OVERLAPPED);
@@ -343,65 +354,55 @@ pub const worker = struct {
             arm(wrk);
         }
 
-        fn postReceive(wrk: *Worker, index: u32, deadline: u64) bool {
+        fn postReceive(wrk: *Worker, index: u32, deadline: u64) ?types.Failure {
             _ = deadline;
             if (index >= wrk.provider_requests.len or wrk.provider_requests[index].operation != null) failFast("worker post ownership", c.ERROR_INVALID_DATA);
             const stride = wrk.stride();
-            var buffer = wrk.arena.view(index, 0, stride) orelse {
-                native.diagnostics.report("worker receive window", c.ERROR_INVALID_DATA);
-                return false;
-            };
+            var buffer = wrk.arena.view(index, 0, stride) orelse failFast("worker receive window", c.ERROR_INVALID_DATA);
             const rq = wrk.request_queues[index];
             if (rq == c.RIO_INVALID_RQ) {
-                native.diagnostics.report("worker receive queue", c.ERROR_INVALID_STATE);
-                return false;
+                failFast("worker receive queue", c.ERROR_INVALID_STATE);
             }
             const submitted_length = buffer.Length;
             if (!wrk.api.?.receive(rq, &buffer, 0, @ptrFromInt(context.encode(index, .receive)))) {
-                native.diagnostics.report("RIOReceive", @bitCast(c.WSAGetLastError()));
-                return false;
+                return native.winsockFailure("RIOReceive");
             }
             wrk.provider_requests[index] = .{ .operation = .receive, .length = submitted_length };
             wrk.provider_outstanding += 1;
-            return true;
+            return null;
         }
 
-        fn postSend(wrk: *Worker, index: u32, offset: u32, length: u32, deadline: u64) bool {
+        fn postSend(wrk: *Worker, index: u32, offset: u32, length: u32, deadline: u64) ?types.Failure {
             _ = deadline;
             if (index >= wrk.provider_requests.len or wrk.provider_requests[index].operation != null) failFast("worker post ownership", c.ERROR_INVALID_DATA);
-            var buffer = wrk.arena.view(index, offset, length) orelse {
-                native.diagnostics.report("worker send window", c.ERROR_INVALID_DATA);
-                return false;
-            };
+            if (length == 0) failFast("worker send window", c.ERROR_INVALID_DATA);
+            var buffer = wrk.arena.view(index, offset, length) orelse failFast("worker send window", c.ERROR_INVALID_DATA);
             const rq = wrk.request_queues[index];
             if (rq == c.RIO_INVALID_RQ) {
-                native.diagnostics.report("worker send queue", c.ERROR_INVALID_STATE);
-                return false;
+                failFast("worker send queue", c.ERROR_INVALID_STATE);
             }
             const submitted_length = buffer.Length;
             if (!wrk.api.?.send(rq, &buffer, 0, @ptrFromInt(context.encode(index, .send)))) {
-                native.diagnostics.report("RIOSend", @bitCast(c.WSAGetLastError()));
-                return false;
+                return native.winsockFailure("RIOSend");
             }
             wrk.provider_requests[index] = .{ .operation = .send, .length = submitted_length };
             wrk.provider_outstanding += 1;
-            return true;
+            return null;
         }
 
-        /// Carries out one engine step. False means the post was refused, which the engine turns
+        /// Carries out one engine step. A failure means the post was refused, which the engine turns
         /// into a connection failure rather than a process failure.
-        fn execute(wrk: *Worker, step: engine.Step) bool {
+        fn execute(wrk: *Worker, step: engine.Step) ?types.Failure {
             switch (step) {
                 .receive => |value| return postReceive(wrk, value.index, value.deadline),
                 .send => |value| return postSend(wrk, value.index, value.offset, value.length, value.deadline),
                 .close => |index| {
                     closeSocket(wrk, index);
-                    return true;
+                    return null;
                 },
                 .release => |index| {
-                    closeSocket(wrk, index);
-                    wrk.credits.?.release();
-                    return true;
+                    releaseSlot(wrk, index);
+                    return null;
                 },
             }
         }
@@ -412,14 +413,17 @@ pub const worker = struct {
                 failFast("worker engine invariant", c.ERROR_INVALID_DATA);
             }
             for (steps) |step| {
-                if (execute(wrk, step)) {
+                const failure = execute(wrk, step) orelse {
                     maybeArm(wrk);
                     continue;
-                }
+                };
+                native.diagnostics.reportFailure(failure);
                 var failure_steps: [1]engine.Step = undefined;
-                const next = wrk.engine_value.onEvent(.{ .post_failed = step.index() }, &failure_steps);
+                const next = wrk.engine_value.onEvent(.{ .post_rejected = .{ .index = step.index(), .failure = failure } }, &failure_steps);
                 if (wrk.engine_value.fatal) failFast("worker refused post ownership", c.ERROR_INVALID_DATA);
-                for (next) |value| _ = execute(wrk, value);
+                for (next) |value| {
+                    if (execute(wrk, value)) |unexpected| failFast(unexpected.stage, @bitCast(unexpected.code));
+                }
             }
         }
 
@@ -579,33 +583,40 @@ pub const worker = struct {
             }
             wrk.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
             if (wrk.ready_event.value == null) {
-                return .{ .failure = native.win32Failure("CreateEvent(worker)") };
+                return .{ .failure = native.win32Failure("CreateEventW(worker ready)") };
             }
             const stride = native.arena.tcpStride(options.rio_buffer_bytes);
             wrk.arena = switch (native.arena.Arena.createResult(api, slot_count, stride)) {
                 .value => |value| value,
                 .failure => |failure| {
-                    return .{ .failure = failure };
+                    var diagnostic = failure;
+                    diagnostic.stage = switch (failure.domain) {
+                        .winsock => "RIORegisterBuffer(worker slots)",
+                        .allocation => "worker registration owners",
+                        .win32 => "VirtualAlloc(worker arena)",
+                        .invariant => failure.stage,
+                    };
+                    return .{ .failure = diagnostic };
                 },
             };
             wrk.connection_sockets = allocator.alloc(native.socket.Socket, slot_count) catch {
-                return .{ .failure = .{ .stage = "allocate worker socket owners", .code = types.error_not_enough_memory, .domain = .allocation } };
+                return .{ .failure = .{ .stage = "worker allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
             };
             for (wrk.connection_sockets) |*owner| owner.* = .{};
             wrk.request_queues = allocator.alloc(c.RIO_RQ, slot_count) catch {
-                return .{ .failure = .{ .stage = "allocate worker request queues", .code = types.error_not_enough_memory, .domain = .allocation } };
+                return .{ .failure = .{ .stage = "worker allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
             };
             @memset(wrk.request_queues, c.RIO_INVALID_RQ);
             wrk.provider_requests = allocator.alloc(ProviderRequest, slot_count) catch
-                return .{ .failure = .{ .stage = "allocate worker provider ledger", .code = types.error_not_enough_memory, .domain = .allocation } };
+                return .{ .failure = .{ .stage = "worker allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
             @memset(wrk.provider_requests, .{});
             wrk.steps = allocator.alloc(engine.Step, engine.stepCapacity(slot_count)) catch {
-                return .{ .failure = .{ .stage = "allocate worker actions", .code = types.error_not_enough_memory, .domain = .allocation } };
+                return .{ .failure = .{ .stage = "worker allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
             };
             wrk.engine_value = engine.TcpEngine.init(slot_count, @as(u64, options.timeout_seconds) * 1000) catch |failure| {
                 return .{ .failure = switch (failure) {
                     error.TimerHeap => types.Failure.invariant("worker engine timer heap"),
-                    else => .{ .stage = "worker engine slots", .code = types.error_not_enough_memory, .domain = .allocation },
+                    else => .{ .stage = "worker allocation", .code = types.error_not_enough_memory, .domain = .allocation },
                 } };
             };
             var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
@@ -1286,8 +1297,7 @@ pub const acceptor = struct {
             .fail => failFast("accept acknowledgement state", c.ERROR_INVALID_DATA),
             .repost => {
                 if (!postAccept(self, operation)) {
-                    const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost");
-                    failAndStop(self, failure.stage, @bitCast(failure.code));
+                    stopAfterFailure(self);
                 }
             },
             .handoff => failFast("accept acknowledgement action", c.ERROR_INVALID_DATA),
@@ -1296,6 +1306,10 @@ pub const acceptor = struct {
 
     fn failAndStop(self: *Acceptor, stage: []const u8, native_error: u32) void {
         native.diagnostics.report(stage, native_error);
+        stopAfterFailure(self);
+    }
+
+    fn stopAfterFailure(self: *Acceptor) void {
         self.failed.?.store(true, .release);
         beginStop(self);
     }
@@ -1363,8 +1377,7 @@ pub const acceptor = struct {
                 if (acceptorCountsFailure(self.core.stopping, self.failed.?.load(.acquire))) self.core.network_errors +%= 1;
                 closeAccepted(operation);
                 if (!postAccept(self, operation)) {
-                    const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost");
-                    failAndStop(self, failure.stage, @bitCast(failure.code));
+                    stopAfterFailure(self);
                 }
             },
             .handoff => |handoff| executeHandoff(self, operation, handoff.worker),
@@ -1394,7 +1407,8 @@ pub const acceptor = struct {
             },
             .handoff => {},
         }
-        const configuration = native.endpoint.updateAcceptContext(operation.socket, self.listener.get()) orelse
+        const context_failure = native.endpoint.updateAcceptContext(operation.socket, self.listener.get());
+        const configuration = context_failure orelse
             native.socket.configure(operation.socket, self.options.?.socket_buffer_bytes, true);
         if (configuration) |failure| {
             self.core.network_errors +%= 1;
@@ -1402,7 +1416,10 @@ pub const acceptor = struct {
             // cleanup below cannot replace the reason this failed.
             if (!self.core.transition(operation.index, .transit, .idle)) failFast("accept configure state", c.ERROR_INVALID_STATE);
             closeAccepted(operation);
-            failAndStop(self, failure.stage, @bitCast(failure.native_error));
+            // The baseline's context-update failure is counted and stops admission quietly.
+            // Socket configuration has its own single diagnostic; neither path adds another.
+            if (context_failure == null) native.diagnostics.report(failure.stage, @bitCast(failure.native_error));
+            stopAfterFailure(self);
             return;
         }
         var local: ?*c.SOCKADDR = null;
@@ -1432,8 +1449,7 @@ pub const acceptor = struct {
             closeAccepted(operation);
             self.core.rejected +%= 1;
             if (!postAccept(self, operation)) {
-                const failure = self.last_failure orelse types.Failure.invariant("AcceptEx repost after capacity rejection");
-                failAndStop(self, failure.stage, @bitCast(failure.code));
+                stopAfterFailure(self);
             }
             return;
         };
@@ -1564,11 +1580,11 @@ pub const acceptor = struct {
 
         self.listener.reset(native.socket.registered(c.SOCK_STREAM, c.IPPROTO_TCP));
         if (self.listener.get() == c.INVALID_SOCKET) {
-            return .{ .failure = native.winsockFailure("TCP listener creation") };
+            return .{ .failure = native.winsockFailure("WSASocketW(TCP listener)") };
         }
         self.port.reset(c.CreateIoCompletionPort(c.INVALID_HANDLE_VALUE, null, 0, 1));
         if (self.port.value == null or self.port.value == c.INVALID_HANDLE_VALUE) {
-            return .{ .failure = native.win32Failure("TCP acceptor IOCP creation") };
+            return .{ .failure = native.win32Failure("CreateIoCompletionPort(acceptor)") };
         }
         self.ready_event.reset(c.CreateEventW(null, c.TRUE, c.FALSE, null));
         if (self.ready_event.value == null) {
@@ -1577,11 +1593,19 @@ pub const acceptor = struct {
         if (native.socket.configure(self.listener.get(), options.socket_buffer_bytes, true)) |failure| {
             return .{ .failure = .{ .stage = failure.stage, .code = failure.native_error } };
         }
-        if (native.endpoint.bindFailure(self.listener.get(), options.port)) |failure| return .{ .failure = failure };
-        if (native.endpoint.listenFailure(self.listener.get())) |failure| return .{ .failure = failure };
+        if (native.endpoint.bindFailure(self.listener.get(), options.port)) |failure| {
+            var diagnostic = failure;
+            diagnostic.stage = "bind/listen";
+            return .{ .failure = diagnostic };
+        }
+        if (native.endpoint.listenFailure(self.listener.get())) |failure| {
+            var diagnostic = failure;
+            diagnostic.stage = "bind/listen";
+            return .{ .failure = diagnostic };
+        }
         const listener_handle: c.HANDLE = @ptrFromInt(self.listener.get());
         if (c.CreateIoCompletionPort(listener_handle, self.port.get(), 0, 1) != self.port.get()) {
-            return .{ .failure = native.win32Failure("associate listener IOCP") };
+            return .{ .failure = native.win32Failure("CreateIoCompletionPort(listener association)") };
         }
         self.accept_ex = switch (native.endpoint.acceptExtensionResult(self.listener.get())) {
             .value => |value| value,
@@ -1594,14 +1618,14 @@ pub const acceptor = struct {
 
         const count = operation_count(self.workerCount());
         self.states = allocator.alloc(State, count) catch {
-            return .{ .failure = .{ .stage = "allocate accept states", .code = types.error_not_enough_memory, .domain = .allocation } };
+            return .{ .failure = .{ .stage = "AcceptEx operation allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
         };
         self.core = Core.init(self.states);
         // Set after the core is built: Core.init replaces the whole record, so a count written before
         // it would be wiped and the rotation would have no workers to walk.
         self.core.worker_count = @intCast(workers.len);
         self.operations = allocator.alloc(Operation, count) catch {
-            return .{ .failure = .{ .stage = "allocate accept operations", .code = types.error_not_enough_memory, .domain = .allocation } };
+            return .{ .failure = .{ .stage = "AcceptEx operation allocation", .code = types.error_not_enough_memory, .domain = .allocation } };
         };
         for (self.operations, 0..) |*operation, index| {
             operation.* = .{
@@ -1621,12 +1645,14 @@ pub const acceptor = struct {
             return false;
         }
         if (c.WaitForSingleObject(self.ready_event.get(), types.infinite) != types.wait_object_0 or
-            !self.ready or !self.startup_ok)
+            !self.ready)
         {
             native.diagnostics.report("acceptor startup readiness", c.ERROR_INVALID_STATE);
             return false;
         }
-        return true;
+        // Initial postAccept failure already reported its native cause. Keep the readiness
+        // handshake quiet for that failure, matching the baseline's single diagnostic.
+        return self.startup_ok;
     }
 
     pub fn stop(self: *Acceptor) void {
@@ -1954,17 +1980,28 @@ pub const udp = struct {
                     return self.initializationFailure(native.win32Failure("CreateIoCompletionPort(UDP)"), false);
                 }
                 if (native.endpoint.bindFailure(self.socket_owner.get(), options.port)) |failure| {
-                    return self.initializationFailure(failure, true);
+                    var diagnostic = failure;
+                    diagnostic.stage = "bind(UDP)";
+                    return self.initializationFailure(diagnostic, true);
                 }
                 self.arena_value = switch (native.arena.Arena.createResult(self.api, options.udp_depth, stride)) {
                     .value => |value| value,
-                    .failure => |failure| return self.initializationFailure(failure, failure.domain == .winsock),
+                    .failure => |failure| {
+                        var diagnostic = failure;
+                        diagnostic.stage = switch (failure.domain) {
+                            .winsock => "UDP slot registrations",
+                            .allocation => "UDP runtime allocation",
+                            .win32 => "VirtualAlloc(UDP arena)",
+                            .invariant => failure.stage,
+                        };
+                        return self.initializationFailure(diagnostic, failure.domain == .winsock);
+                    },
                 };
                 self.slot_states = allocator.alloc(SlotState, options.udp_depth) catch
-                    return self.initializationFailure(.{ .stage = "allocate UDP slot states", .code = types.error_not_enough_memory, .domain = .allocation }, false);
+                    return self.initializationFailure(.{ .stage = "UDP runtime allocation", .code = types.error_not_enough_memory, .domain = .allocation }, false);
                 self.engine_value = Engine.initWithCapacity(self.slot_states, self.capacity);
                 self.slots = allocator.alloc(Slot, options.udp_depth) catch
-                    return self.initializationFailure(.{ .stage = "allocate UDP slots", .code = types.error_not_enough_memory, .domain = .allocation }, false);
+                    return self.initializationFailure(.{ .stage = "UDP runtime allocation", .code = types.error_not_enough_memory, .domain = .allocation }, false);
                 @memset(self.slots, .{});
                 var notification: c.RIO_NOTIFICATION_COMPLETION = std.mem.zeroes(c.RIO_NOTIFICATION_COMPLETION);
                 notification.Type = c.RIO_IOCP_COMPLETION;
@@ -1973,7 +2010,7 @@ pub const udp = struct {
                 notification.Iocp.Overlapped = &self.notification;
                 self.queue.reset(self.api, self.api.createCq(options.cq_capacity, &notification));
                 if (!self.queue.valid()) {
-                    return self.initializationFailure(native.winsockFailure("RIOCreateCompletionQueue(UDP)"), true);
+                    return self.initializationFailure(native.winsockFailure("UDP RIO CQ creation"), true);
                 }
                 self.request_queue = self.api.createRq(self.socket_owner.get(), options.udp_depth, 1, options.udp_depth, 1, self.queue.value, self.queue.value, @ptrCast(self.slots.ptr));
                 if (self.request_queue == c.RIO_INVALID_RQ) {
@@ -2011,7 +2048,7 @@ pub const udp = struct {
                     .receive => self.api.receiveEx(self.request_queue, &payload, &remote, context_value),
                     .send => self.api.sendEx(self.request_queue, &payload, &remote, context_value),
                 };
-                if (!accepted) return native.winsockFailure(if (value.operation == .receive) "RIOReceiveEx(UDP)" else "RIOSendEx(UDP)");
+                if (!accepted) return native.winsockFailure(if (self.engine_value.statistics.completions == 0) "RIOReceiveEx(UDP)" else "UDP RIO repost");
                 self.slots[value.index].payload = payload;
                 self.slots[value.index].remote_address = remote;
                 self.slots[value.index].provider_operation = value.operation;
@@ -2104,7 +2141,7 @@ pub const udp = struct {
                 if (options.stats) {
                     var buffer: [512]u8 = undefined;
                     const line = self.engine_value.statistics.writeFinalLine(.udp, native.nowMilliseconds() - start, 1, self.engine_value.outstanding, &buffer) orelse failFast("format UDP statistics", c.ERROR_INSUFFICIENT_BUFFER);
-                    if (!native.diagnostics.writeStdout(line)) failFast("write UDP statistics", c.GetLastError());
+                    _ = native.diagnostics.writeStdout(line);
                 }
                 const failed = self.engine_value.failed;
                 self.deinit();
@@ -2120,8 +2157,12 @@ pub const udp = struct {
                 return .usage;
             };
             const arena_bytes = contract.checkedPageRoundedArenaBytes(options.udp_depth, stride, options.memory_bytes, native.pageBytes()) orelse 0;
-            if (options.udp_depth == 0 or options.udp_depth > options.cq_capacity / 2 or arena_bytes == 0 or arena_bytes > std.math.maxInt(u32)) {
-                native.diagnostics.report("UDP queue/arena capacity", c.ERROR_NOT_ENOUGH_MEMORY);
+            if (options.udp_depth > options.cq_capacity / 2) {
+                native.diagnostics.report("UDP CQ capacity", c.ERROR_INSUFFICIENT_BUFFER);
+                return .usage;
+            }
+            if (options.udp_depth == 0 or arena_bytes == 0 or arena_bytes > std.math.maxInt(u32)) {
+                native.diagnostics.report("UDP registered arena", c.ERROR_NOT_ENOUGH_MEMORY);
                 return .usage;
             }
             var value = Runtime{ .api = api, .capacity = capacity };
@@ -2163,11 +2204,6 @@ pub const udp = struct {
                     value.snapshot.deliveries +%= 1;
                     var batches: u32 = 0;
                     while (batches < types.completion_drain_batches) : (batches += 1) {
-                        if (!value.engine_value.closing and (stop.load(.acquire) or
-                            (options.run_seconds != 0 and native.nowMilliseconds() - start >= @as(u64, options.run_seconds) * 1000)))
-                        {
-                            value.execute(value.engine_value.onEvent(.stop));
-                        }
                         const count = native.guards.requireDequeueCount(value.api.dequeue(value.queue.value, &results, types.completion_batch_size), types.completion_batch_size, "RIODequeueCompletion(UDP)");
                         if (count == 0) break;
                         for (results[0..count]) |result| value.processResult(result);
