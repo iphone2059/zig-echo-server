@@ -541,7 +541,7 @@ test "a successful completion that races the stop is withdrawn instead of config
     try std.testing.expectEqual(acceptor.State.transit, core.state(0).?);
 
     // The guard withdraws on the acceptor's own stop state, so the closed socket is never configured.
-    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(core.stopping, false, true));
+    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(core.stopping, false, false, false));
     try std.testing.expect(core.returnSlot(0));
     try std.testing.expectEqual(acceptor.State.idle, core.state(0).?);
     try std.testing.expectEqual(@as(u32, 0), core.liveCount());
@@ -602,19 +602,18 @@ test "a handoff reaching a stopping worker is withdrawn rather than adopted" {
     _ = engine_value.beginStop(&steps);
     try std.testing.expectEqual(@as(?u32, null), engine_value.takeSlot());
 }
-test "the handoff guard separates a stop from a broken invariant" {
-    // The whole decision table, with no listener, no socket and no operation record. The first case
-    // is the withdrawal that keeps SO_UPDATE_ACCEPT_CONTEXT off a closed socket; the second is the
-    // invariant failure that must not be silently withdrawn; the third is the positive control that
-    // keeps the guard from refusing every handoff.
-    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(true, false, false));
-    // A stop owns the explanation even when the handle already looks invalid.
-    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(true, false, true));
-    // The global failure flag unposts this acceptor too, so the same withdrawal applies.
-    try std.testing.expectEqual(acceptor.Disposition.withdraw, acceptor.handoffDisposition(false, true, false));
-    // Out of stop an unusable handle has no benign reading.
-    try std.testing.expectEqual(acceptor.Disposition.fatal, acceptor.handoffDisposition(false, false, true));
-    try std.testing.expectEqual(acceptor.Disposition.handoff, acceptor.handoffDisposition(false, false, false));
+test "the handoff guard separates lifecycle withdrawal from a broken accepted socket" {
+    const expected = [_]acceptor.Disposition{
+        .withdraw, .withdraw, .withdraw, .withdraw, .fatal,   .withdraw, .withdraw, .withdraw,
+        .withdraw, .withdraw, .withdraw, .withdraw, .handoff, .withdraw, .withdraw, .withdraw,
+    };
+    for (0..16) |bits| {
+        const stopping = bits & 1 != 0;
+        const failed = bits & 2 != 0;
+        const listener_valid = bits & 4 != 0;
+        const accepted_valid = bits & 8 != 0;
+        try std.testing.expectEqual(expected[bits], acceptor.handoffDisposition(stopping, failed, listener_valid, accepted_valid));
+    }
 }
 
 test "a slot is reused only after its handoff is acknowledged" {

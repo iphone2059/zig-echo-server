@@ -103,7 +103,7 @@ test "explicit zero values and numeric boundaries match the baseline" {
     try std.testing.expectEqualStrings(contract.tokens.invalid_number, errorText(&error_buffer));
     try std.testing.expect(!parse(&.{ "server", "/p", "sctp" }, &options, &error_buffer));
     try std.testing.expectEqualStrings(contract.tokens.out_of_range, errorText(&error_buffer));
-    try std.testing.expect(!parse(&.{ "server" }, &options, &error_buffer));
+    try std.testing.expect(!parse(&.{"server"}, &options, &error_buffer));
     try std.testing.expectEqualStrings(contract.tokens.missing_protocol, errorText(&error_buffer));
 }
 

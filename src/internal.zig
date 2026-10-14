@@ -922,7 +922,7 @@ pub const acceptor = struct {
     pub const Disposition = enum(u8) {
         /// The stop owns this slot's socket: retire the slot instead of configuring a closed socket.
         withdraw,
-        /// A live admission path lost its socket or listener, so the invariant no longer holds.
+        /// A healthy admission path lost its accepted socket, so ownership is corrupt.
         fatal,
         /// Admission is still healthy and both handles are usable.
         handoff,
@@ -930,14 +930,20 @@ pub const acceptor = struct {
 
     /// Decides the handoff guard purely, without a listener and without an operation record.
     ///
-    /// stopping comes first on purpose: while the acceptor is extracting, a missing socket is the
-    /// expected result of beginStop closing it, not a fault. Only once that explanation is gone does
-    /// an unusable handle mean the invariant broke. This is the reference's handoff guard, which
-    /// answers Withdrawn under stop and Failed otherwise.
-    pub fn handoffDisposition(stopping: bool, failed: bool, invalid_handle: bool) Disposition {
-        if (stopping or failed) return .withdraw;
-        if (invalid_handle) return .fatal;
+    /// Stop, global failure and listener retirement withdraw admission. Only an accepted socket
+    /// missing while admission is otherwise healthy breaks the ownership invariant.
+    pub fn handoffDisposition(stopping: bool, failed: bool, listener_valid: bool, accepted_valid: bool) Disposition {
+        if (stopping or failed or !listener_valid) return .withdraw;
+        if (!accepted_valid) return .fatal;
         return .handoff;
+    }
+
+    /// Runtime boundary shared by production and the process fault driver. The pure decision above
+    /// does not report errors or release resources.
+    pub fn requireHandoffDisposition(stopping: bool, failed: bool, listener_valid: bool, accepted_valid: bool) Disposition {
+        const disposition = handoffDisposition(stopping, failed, listener_valid, accepted_valid);
+        if (disposition == .fatal) failFast("AcceptEx handoff invariant", c.WSAENOTSOCK);
+        return disposition;
     }
 
     /// Completion statuses an accept can recover from instead of failing the listener. A peer that
@@ -1395,16 +1401,12 @@ pub const acceptor = struct {
         // socket that is already gone, and the close is idempotent because beginStop leaves
         // INVALID_SOCKET behind, so an unpost that raced the completion retires quietly and is not
         // counted as a new network fault. The decision itself is the pure one above.
-        const invalid_handle = self.listener.get() == c.INVALID_SOCKET or operation.socket == c.INVALID_SOCKET;
-        switch (handoffDisposition(self.core.stopping, self.failed.?.load(.acquire), invalid_handle)) {
+        switch (requireHandoffDisposition(self.core.stopping, self.failed.?.load(.acquire), self.listener.get() != c.INVALID_SOCKET, operation.socket != c.INVALID_SOCKET)) {
             .withdraw => {
                 withdrawSlot(self, operation);
                 return;
             },
-            .fatal => {
-                failAndStop(self, "AcceptEx handoff invariant", c.WSAENOTSOCK);
-                return;
-            },
+            .fatal => unreachable,
             .handoff => {},
         }
         const context_failure = native.endpoint.updateAcceptContext(operation.socket, self.listener.get());

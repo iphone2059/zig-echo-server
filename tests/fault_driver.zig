@@ -13,6 +13,17 @@ pub fn main(init: std.process.Init) u8 {
     const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return 4;
     if (argv.len != 2) return 1;
     const mode = argv[1];
+    if (std.mem.eql(u8, mode, "handoff_invalid")) {
+        _ = acceptor.requireHandoffDisposition(false, false, true, false);
+        return 1;
+    }
+    if (std.mem.eql(u8, mode, "handoff_positive")) {
+        if (acceptor.requireHandoffDisposition(false, false, true, true) != .handoff or
+            acceptor.requireHandoffDisposition(true, false, true, false) != .withdraw or
+            acceptor.requireHandoffDisposition(false, true, true, false) != .withdraw or
+            acceptor.requireHandoffDisposition(false, false, false, false) != .withdraw) return 1;
+        return 0;
+    }
     if (std.mem.eql(u8, mode, "notify_failure")) {
         server.native.guards.requireNotifySuccess(-1, "RIONotify(worker)");
     }
@@ -41,7 +52,7 @@ pub fn main(init: std.process.Init) u8 {
             .quiet = true,
             .stats = true,
         };
-        return @intFromEnum(server.server.runServer(&options));
+        return @backingInt(server.server.runServer(&options));
     }
     if (std.mem.eql(u8, mode, "worker_not_started")) {
         // The other half of a partially failed startup: a worker whose tcp.start never produced a

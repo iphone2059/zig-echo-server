@@ -11,15 +11,30 @@ New-Item -ItemType Directory -Path $scratch | Out-Null
 # Every boundary is driven in its own child process and waited for with a bound. An unbounded wait
 # would let a boundary that never terminates hang the whole gate instead of failing it.
 function Invoke-Fault([string]$Mode, [string]$Stdout, [string]$Stderr) {
-    $process = Start-Process -FilePath $driver -ArgumentList @($Mode) -PassThru -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
-    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-        Stop-Process -Id $process.Id -Force
-        throw "$Mode did not reach its boundary within $TimeoutMilliseconds ms."
+    $process = Start-Process -FilePath $driver -ArgumentList @($Mode) -PassThru -WindowStyle Hidden -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+    try {
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) { throw "$Mode did not reach its boundary within $TimeoutMilliseconds ms." }
+        return $process.ExitCode
+    } finally {
+        try {
+            if (-not $process.HasExited) { $process.Kill($true); if (-not $process.WaitForExit(5000)) { throw "$Mode cleanup timeout." } }
+        } finally { $process.Dispose() }
     }
-    return $process.ExitCode
 }
 
 try {
+    foreach ($mode in @('handoff_positive','handoff_invalid')) {
+        $stdout = Join-Path $scratch "$mode.stdout.txt"
+        $stderr = Join-Path $scratch "$mode.stderr.txt"
+        $exitCode = Invoke-Fault -Mode $mode -Stdout $stdout -Stderr $stderr
+        $expectedExit = if ($mode -eq 'handoff_positive') { 0 } else { 4 }
+        $errorOutput = [string](Get-Content -Raw -LiteralPath $stderr)
+        if ($exitCode -ne $expectedExit) { throw "$mode exited $exitCode, expected ${expectedExit}: $errorOutput" }
+        if ([string](Get-Content -Raw -LiteralPath $stdout)) { throw "$mode unexpectedly wrote stdout" }
+        if ($mode -eq 'handoff_positive') {
+            if (-not [string]::IsNullOrWhiteSpace($errorOutput)) { throw "$mode unexpectedly wrote stderr: $errorOutput" }
+        } elseif ($errorOutput -notmatch '(?m)^AcceptEx handoff invariant failed: native_error=10038\r?$') { throw "$mode lost exact invariant diagnostic: $errorOutput" }
+    }
     $expected = @{
         notify_failure = 'RIONotify(worker)'
         corrupt_cq = 'RIODequeueCompletion(worker)'
@@ -75,5 +90,8 @@ try {
     Write-Host 'fault_process_tests: PASS'
 }
 finally {
+    $resolvedScratch = [System.IO.Path]::GetFullPath($scratch)
+    $resolvedTempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    if (-not $resolvedScratch.StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fault scratch escaped the temporary directory' }
     Remove-Item -LiteralPath $scratch -Recurse -Force
 }
