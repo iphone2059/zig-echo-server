@@ -1817,7 +1817,10 @@ pub const udp = struct {
         }
 
         pub fn onPosted(self: *Engine, index: u32, operation: types.EngineOperation) bool {
-            if (index >= self.slots.len or self.closing or self.slots[index].outstanding) return false;
+            // Every precondition of markPosted is evaluated before the slot is touched, so a posting
+            // that the ledger rejects leaves the slot exactly as it was.
+            if (index >= self.slots.len or self.closing or self.slots[index].outstanding or
+                self.outstanding >= self.slots.len) return false;
             self.slots[index].direction = operation;
             if (operation == .receive) self.slots[index].payload_length = self.payload_bytes;
             return self.markPosted(index);

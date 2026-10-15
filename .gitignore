@@ -2,3 +2,5 @@
 zig-out/
 .worktrees/
 
+# Verification artifacts (latest.csv, latest-summary.csv, archive/, cases/)
+tools/verification/results/
