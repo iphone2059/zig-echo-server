@@ -528,7 +528,11 @@ pub const arena = struct {
 
         pub fn deinit(self: *VirtualMemory) void {
             if (self.pointer) |base| {
-                _ = c.VirtualFree(base, 0, c.MEM_RELEASE);
+                // A failed release means Windows still holds the whole registered region: that is a
+                // release boundary invariant, so it fails fast instead of being ignored.
+                if (c.VirtualFree(base, 0, c.MEM_RELEASE) == c.FALSE) {
+                    diagnostics.failFast("VirtualFree(arena)", c.GetLastError());
+                }
                 self.pointer = null;
             }
         }
