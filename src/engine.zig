@@ -185,11 +185,20 @@ pub const TcpEngine = struct {
             return null;
         }
         const connection = &self.connections[index];
+        // Ownership counters are checked, never saturating: reaching the maximum means the
+        // accounting itself is broken. The connection record is reset by admit, so its own counter
+        // is provably 1 afterwards and only the two engine counters can overflow here.
+        if (self.active_connections == std.math.maxInt(u32) or
+            self.rio_outstanding == std.math.maxInt(u32))
+        {
+            self.fatal = true;
+            self.failure = types.Failure.invariant("TCP admission ownership counter overflow");
+            return null;
+        }
         _ = connection.admit(now, self.timeout_milliseconds);
-        connection.outstanding +|= 1;
         self.statistics.accepted +%= 1;
-        self.active_connections +|= 1;
-        self.rio_outstanding +|= 1;
+        self.active_connections += 1;
+        self.rio_outstanding += 1;
         self.schedule(index, connection.deadline);
         return .{ .receive = .{ .index = index, .deadline = connection.deadline } };
     }
@@ -266,8 +275,9 @@ pub const TcpEngine = struct {
         self.rio_outstanding -= 1;
         const connection = &self.connections[index];
         // The step that asked for this post already counted the operation, but RIO never queued it,
-        // so the count has to come back down before the close.
-        connection.outstanding -|= 1;
+        // so the count has to come back down before the close. The guard above proved the slot
+        // holds an operation, so this decrement cannot underflow.
+        connection.outstanding -= 1;
         return self.apply(index, connection.close());
     }
 
@@ -382,14 +392,12 @@ pub const TcpEngine = struct {
                 return null;
             },
             .receive => {
-                connection.outstanding +|= 1;
-                self.rio_outstanding +|= 1;
+                if (!self.reservePostedOwnership()) return null;
                 self.schedule(index, connection.deadline);
                 return .{ .receive = .{ .index = index, .deadline = connection.deadline } };
             },
             .send => |value| {
-                connection.outstanding +|= 1;
-                self.rio_outstanding +|= 1;
+                if (!self.reservePostedOwnership()) return null;
                 self.schedule(index, connection.deadline);
                 return .{ .send = .{
                     .index = index,
@@ -415,6 +423,20 @@ pub const TcpEngine = struct {
                 return .{ .release = index };
             },
         }
+    }
+
+    /// Charges one posted operation to the worker ledger. The connection charges its own count in
+    /// the same step that arms the operation, so this moves only the worker's. The counter is
+    /// checked: reaching the maximum means the ledger is already broken, so the engine fails instead
+    /// of freezing the count at the ceiling and hiding the release that should follow.
+    fn reservePostedOwnership(self: *TcpEngine) bool {
+        if (self.rio_outstanding == std.math.maxInt(u32)) {
+            self.fatal = true;
+            self.failure = types.Failure.invariant("TCP posted ownership counter overflow");
+            return false;
+        }
+        self.rio_outstanding += 1;
+        return true;
     }
 
     fn schedule(self: *TcpEngine, index: u32, deadline: u64) void {

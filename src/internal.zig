@@ -76,7 +76,10 @@ pub const connection = struct {
         /// connection timeout.
         pub fn admit(self: *Connection, now: u64, timeout_milliseconds: u64) Step {
             self.state = .receiving;
-            self.outstanding = 0;
+            // The receive this arms stays posted ownership until its completion retires it, so the
+            // count of armed operations is already one here. Charging it in the same place that
+            // resets the record is what keeps the counter exact instead of clamped.
+            self.outstanding = 1;
             self.echo_bytes = 0;
             self.send_offset = 0;
             self.deadline = now +% timeout_milliseconds;
@@ -92,7 +95,9 @@ pub const connection = struct {
             now: u64,
             timeout_milliseconds: u64,
         ) Step {
-            self.outstanding -|= 1;
+            // The engine validates that this slot holds an operation before it calls here
+            // (TcpEngine.onCompletion), so ownership is retired by exactly one, checked decrement.
+            self.outstanding -= 1;
             if (self.state == .closing) {
                 // A socket closed with work in flight still has to be drained before the slot can be
                 // handed to a new connection. The socket is already closed, so the release simply
@@ -108,6 +113,7 @@ pub const connection = struct {
                     self.send_offset = 0;
                     self.deadline = now +% timeout_milliseconds;
                     self.state = .sending;
+                    self.outstanding += 1;
                     return .{ .send = .{ .offset = 0, .length = bytes } };
                 },
                 .send => {
@@ -118,12 +124,14 @@ pub const connection = struct {
                         return self.close();
                     }
                     if (self.send_offset < self.echo_bytes) {
+                        self.outstanding += 1;
                         return .{ .send = .{
                             .offset = self.send_offset,
                             .length = self.echo_bytes - self.send_offset,
                         } };
                     }
                     self.state = .receiving;
+                    self.outstanding += 1;
                     return .receive;
                 },
             }
