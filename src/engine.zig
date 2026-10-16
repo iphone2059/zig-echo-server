@@ -186,10 +186,18 @@ pub const TcpEngine = struct {
         }
         const connection = &self.connections[index];
         _ = connection.admit(now, self.timeout_milliseconds);
-        connection.outstanding +|= 1;
+        if (connection.outstanding == std.math.maxInt(u32) or
+            self.active_connections == std.math.maxInt(u32) or
+            self.rio_outstanding == std.math.maxInt(u32))
+        {
+            self.fatal = true;
+            self.failure = types.Failure.invariant("TCP admission ownership counter overflow");
+            return null;
+        }
+        connection.outstanding += 1;
         self.statistics.accepted +%= 1;
-        self.active_connections +|= 1;
-        self.rio_outstanding +|= 1;
+        self.active_connections += 1;
+        self.rio_outstanding += 1;
         self.schedule(index, connection.deadline);
         return .{ .receive = .{ .index = index, .deadline = connection.deadline } };
     }
@@ -382,14 +390,24 @@ pub const TcpEngine = struct {
                 return null;
             },
             .receive => {
-                connection.outstanding +|= 1;
-                self.rio_outstanding +|= 1;
+                if (connection.outstanding == std.math.maxInt(u32) or self.rio_outstanding == std.math.maxInt(u32)) {
+                    self.fatal = true;
+                    self.failure = types.Failure.invariant("TCP posted operation ownership counter overflow");
+                    return null;
+                }
+                connection.outstanding += 1;
+                self.rio_outstanding += 1;
                 self.schedule(index, connection.deadline);
                 return .{ .receive = .{ .index = index, .deadline = connection.deadline } };
             },
             .send => |value| {
-                connection.outstanding +|= 1;
-                self.rio_outstanding +|= 1;
+                if (connection.outstanding == std.math.maxInt(u32) or self.rio_outstanding == std.math.maxInt(u32)) {
+                    self.fatal = true;
+                    self.failure = types.Failure.invariant("TCP posted operation ownership counter overflow");
+                    return null;
+                }
+                connection.outstanding += 1;
+                self.rio_outstanding += 1;
                 self.schedule(index, connection.deadline);
                 return .{ .send = .{
                     .index = index,
