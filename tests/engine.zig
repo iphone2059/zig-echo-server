@@ -203,17 +203,19 @@ test "a zero-byte datagram is preserved and a reset recovers the receive depth" 
 }
 
 test "the RIO request context round trips and rejects a forged value" {
-    const encoded = server.worker.context.encode(7, .send);
+    const encoded = server.worker.context.encode(7, .send, 9);
     try std.testing.expect(encoded != 0);
     const decoded = server.worker.context.decode(encoded, 8).?;
     try std.testing.expectEqual(@as(u32, 7), decoded.index);
     try std.testing.expectEqual(types.EngineOperation.send, decoded.operation);
-    const receive = server.worker.context.decode(server.worker.context.encode(3, .receive), 8).?;
+    try std.testing.expectEqual(@as(u32, 9), decoded.generation);
+    const receive = server.worker.context.decode(server.worker.context.encode(3, .receive, 1), 8).?;
     try std.testing.expectEqual(@as(u32, 3), receive.index);
     try std.testing.expectEqual(types.EngineOperation.receive, receive.operation);
+    try std.testing.expectEqual(@as(u32, 1), receive.generation);
     // A zero context and one that names a slot the worker does not own are both rejected.
     try std.testing.expect(server.worker.context.decode(0, 8) == null);
-    try std.testing.expect(server.worker.context.decode(server.worker.context.encode(8, .receive), 8) == null);
+    try std.testing.expect(server.worker.context.decode(server.worker.context.encode(8, .receive, 1), 8) == null);
     try std.testing.expect(server.worker.context.decode(1 << 40, 8) == null);
 }
 

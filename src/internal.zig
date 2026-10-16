@@ -45,6 +45,9 @@ pub const connection = struct {
 
     pub const Connection = struct {
         index: u32 = 0,
+        /// Identity of the generation currently admitted into this slot. It changes only at the
+        /// slot's reuse point, so a completion can be told apart from one of an earlier generation.
+        generation: u32 = 0,
         state: State = .idle,
         /// RIO operations posted and not yet completed. Never exceeds two: one receive or one send
         /// at a time.
@@ -76,6 +79,9 @@ pub const connection = struct {
         /// connection timeout.
         pub fn admit(self: *Connection, now: u64, timeout_milliseconds: u64) Step {
             self.state = .receiving;
+            // Adopting the slot is its only reuse point, so this is where the generation changes. It
+            // is an identity rather than an ownership ledger, and wraps to one at the limit.
+            self.generation = if (self.generation == std.math.maxInt(u32)) 1 else self.generation + 1;
             // The receive this arms stays posted ownership until its completion retires it, so the
             // count of armed operations is already one here. Charging it in the same place that
             // resets the record is what keeps the counter exact instead of clamped.
@@ -274,21 +280,24 @@ pub const worker = struct {
     /// is only recycled once every one of its completions has been dequeued, so a context can never
     /// alias a live request of a different connection.
     pub const context = struct {
-        pub fn encode(index: u32, operation: types.EngineOperation) usize {
+        pub fn encode(index: u32, operation: types.EngineOperation, generation: u32) usize {
             // The index is stored one-based so the packed value is never the null context, which
-            // leaves the low bit free for the operation.
-            return (@as(usize, index + 1) << 1) | @as(usize, @backingInt(operation));
+            // leaves the low bit free for the operation. The generation occupies the high half, so a
+            // completion that belongs to a generation the slot has since left can be rejected instead
+            // of being attributed to the generation that happens to own the slot now.
+            return (@as(usize, generation) << 32) | (@as(usize, index + 1) << 1) | @as(usize, @backingInt(operation));
         }
 
-        pub const Decoded = struct { index: u32, operation: types.EngineOperation };
+        pub const Decoded = struct { index: u32, operation: types.EngineOperation, generation: u32 };
 
         pub fn decode(value: usize, slot_count: u32) ?Decoded {
             if (value == 0) return null;
-            const stored = value >> 1;
+            const stored = (value >> 1) & 0x7FFF_FFFF;
             if (stored == 0 or stored - 1 >= slot_count) return null;
             return .{
                 .index = @intCast(stored - 1),
                 .operation = if (value & 1 == 1) .send else .receive,
+                .generation = @truncate(value >> 32),
             };
         }
     };
@@ -362,6 +371,15 @@ pub const worker = struct {
             arm(wrk);
         }
 
+        /// The generation the engine has currently admitted into this slot. A posted request carries
+        /// its generation in its context, so a completion is checked against the generation that
+        /// posted it rather than the one the slot happens to hold when it arrives.
+        fn generationAt(wrk: *const Worker, index: u32) u32 {
+            const admitted = wrk.engine_value.connectionAt(index) orelse
+                failFast("worker request context slot", c.ERROR_INVALID_DATA);
+            return admitted.generation;
+        }
+
         fn postReceive(wrk: *Worker, index: u32, deadline: u64) ?types.Failure {
             _ = deadline;
             if (index >= wrk.provider_requests.len or wrk.provider_requests[index].operation != null) failFast("worker post ownership", c.ERROR_INVALID_DATA);
@@ -372,7 +390,7 @@ pub const worker = struct {
                 failFast("worker receive queue", c.ERROR_INVALID_STATE);
             }
             const submitted_length = buffer.Length;
-            if (!wrk.api.?.receive(rq, &buffer, 0, @ptrFromInt(context.encode(index, .receive)))) {
+            if (!wrk.api.?.receive(rq, &buffer, 0, @ptrFromInt(context.encode(index, .receive, generationAt(wrk, index))))) {
                 return native.winsockFailure("RIOReceive");
             }
             wrk.provider_requests[index] = .{ .operation = .receive, .length = submitted_length };
@@ -390,7 +408,7 @@ pub const worker = struct {
                 failFast("worker send queue", c.ERROR_INVALID_STATE);
             }
             const submitted_length = buffer.Length;
-            if (!wrk.api.?.send(rq, &buffer, 0, @ptrFromInt(context.encode(index, .send)))) {
+            if (!wrk.api.?.send(rq, &buffer, 0, @ptrFromInt(context.encode(index, .send, generationAt(wrk, index))))) {
                 return native.winsockFailure("RIOSend");
             }
             wrk.provider_requests[index] = .{ .operation = .send, .length = submitted_length };
@@ -456,6 +474,9 @@ pub const worker = struct {
             const raw = result.RequestContext orelse failFast("worker null RequestContext", c.ERROR_INVALID_DATA);
             const decoded = context.decode(@intFromPtr(raw), wrk.engine_value.slotCount()) orelse
                 failFast("worker RIO RequestContext", c.ERROR_INVALID_DATA);
+            if (decoded.generation != generationAt(wrk, decoded.index)) {
+                failFast("worker completion generation", c.ERROR_INVALID_DATA);
+            }
             if (decoded.index >= wrk.provider_requests.len or wrk.provider_outstanding == 0 or
                 wrk.provider_requests[decoded.index].operation == null or wrk.provider_requests[decoded.index].operation.? != decoded.operation or
                 wrk.provider_outstanding != wrk.engine_value.outstanding())
