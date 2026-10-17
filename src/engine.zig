@@ -583,6 +583,28 @@ test "slots are handed out lowest first and reused after release" {
     try std.testing.expectEqual(@as(u32, 1), reused.index());
 }
 
+test "a slot that still owns provider work is never recycled" {
+    var engine_value = try TcpEngine.init(2, 5_000);
+    defer engine_value.deinit();
+
+    // The adopted slot owns the first receive, so the withdrawn-handoff route must refuse it.
+    const adopted = engine_value.adoptNext(1_000).?;
+    try std.testing.expectEqual(@as(u32, 1), engine_value.freeCount());
+    engine_value.returnSlot(adopted.index());
+    try std.testing.expect(engine_value.fatal);
+    try std.testing.expectEqual(@as(u32, 1), engine_value.freeCount());
+}
+
+test "a free entry whose connection is not idle is refused" {
+    var engine_value = try TcpEngine.init(2, 5_000);
+    defer engine_value.deinit();
+
+    // Divergence the way a broken ledger would produce it: a slot listed as free while active.
+    engine_value.connections[0].state = .receiving;
+    _ = engine_value.takeSlot();
+    try std.testing.expect(engine_value.fatal);
+}
+
 test "a refused post closes without waiting for a completion" {
     var engine_value = try TcpEngine.init(2, 10_000);
     defer engine_value.deinit();
