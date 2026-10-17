@@ -153,8 +153,13 @@ pub const TcpEngine = struct {
         if (self.free_count == 0) return null;
         self.free_count -= 1;
         const index = self.free_indices[self.free_count];
-        if (index >= self.connections.len) {
+        // A slot is handed out only when the pool and the ownership table agree: an out-of-range
+        // entry, or one whose connection still holds provider work, means they have diverged.
+        if (index >= self.connections.len or
+            !self.connections[index].isIdle() or self.connections[index].outstanding != 0)
+        {
             self.fatal = true;
+            self.failure = types.Failure.invariant("TCP take slot ownership");
             return null;
         }
         return index;
@@ -172,8 +177,20 @@ pub const TcpEngine = struct {
     }
 
     /// Gives a taken slot back without adopting it, used when the request queue could not be made.
+    /// The slot must hold nothing the provider could still reach, or the pool would hand out a
+    /// connection whose previous generation is not retired.
     pub fn returnSlot(self: *TcpEngine, index: u32) void {
-        if (index < self.connections.len) self.connections[index].state = .idle;
+        if (index >= self.connections.len) {
+            self.fatal = true;
+            return;
+        }
+        const connection = &self.connections[index];
+        if (connection.outstanding != 0 or connection.isActive()) {
+            self.fatal = true;
+            self.failure = types.Failure.invariant("TCP return slot ownership");
+            return;
+        }
+        connection.state = .idle;
         self.pushFree(index);
     }
 
@@ -412,6 +429,13 @@ pub const TcpEngine = struct {
                 return .{ .close = index };
             },
             .close_and_release => {
+                // The drain barrier: a slot returns to the free list only once every operation of
+                // its generation has been retired, never because a timer or a socket close said so.
+                if (connection.outstanding != 0) {
+                    self.fatal = true;
+                    self.failure = types.Failure.invariant("TCP release with outstanding operations");
+                    return null;
+                }
                 _ = self.timers.remove(index);
                 connection.state = .idle;
                 self.pushFree(index);
